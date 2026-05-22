@@ -49,7 +49,7 @@ spec:
       description: |
         How to handle duplicate tool / resource / prompt names across
         upstream MCP servers when aggregating manifests.
-        - prefix: rename to `<serverName>.<originalName>` (default).
+        - prefix: rename to `<serverName>_<originalName>` (default).
         - reject: fail aggregation with an MCP-compliant error.
         - firstWins: keep the first server's entry, drop subsequent dupes.
         - lastWins: overwrite with the most recently seen entry.
