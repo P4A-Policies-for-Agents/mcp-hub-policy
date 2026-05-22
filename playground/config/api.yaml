@@ -1,0 +1,41 @@
+# Copyright 2026 Salesforce, Inc. All rights reserved.
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: ApiInstance
+metadata:
+  name: ingress-http
+spec:
+  address: http://0.0.0.0:8081
+  services:
+    upstream:
+      # The policy short-circuits the /mcp endpoint and orchestrates calls
+      # to the upstream MCP servers declared in the `mcpServers` config.
+      # The configured upstream below exists only because Flex Gateway
+      # requires every ApiInstance to declare one. With strictMode=true
+      # non-/mcp routes are rejected with 404 before reaching this upstream.
+      address: https://api.salesforce.com
+      routes:
+        - config:
+            destinationPath: /
+  policies:
+    - policyRef:
+        name: mcp-hub-policy-v0-1-impl # overridden by `make run`
+        namespace: default
+      config:
+        mcpEndpoint: "/mcp"
+        strictMode: true
+        collisionStrategy: prefix
+        aggregationTimeoutMs: 5000
+        perRequestTimeoutMs: 30000
+        mcpServers:
+          - name: jira
+            endpoint: https://jira.example.com/mcp
+            enabled: true
+            authType: bearerToken
+            token: REPLACE_WITH_JIRA_TOKEN
+          - name: slack
+            endpoint: https://slack.example.com/mcp
+            enabled: true
+            authType: apiKeyHeader
+            headerName: x-api-key
+            apiKey: REPLACE_WITH_SLACK_KEY

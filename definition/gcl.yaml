@@ -1,0 +1,200 @@
+---
+apiVersion: gateway.mulesoft.com/v1alpha1
+kind: Extension
+metadata:
+  labels:
+    title: MCP Hub Policy
+    description: |
+      Aggregates multiple upstream MCP (Model Context Protocol) servers
+      behind a single virtual `/mcp` endpoint. Implements the MCP
+      Streamable HTTP transport: aggregates `tools/list`, `resources/list`,
+      `prompts/list` from every configured upstream and routes
+      `tools/call`, `resources/read`, `prompts/get` to the owning server.
+      Per-server authentication and arbitrary headers are configured
+      declaratively in API Manager.
+    category: AI
+    metadata/interfaceScope: api,resource
+    metadata/capabilities/injectionPoint: inbound
+spec:
+  extends:
+    - name: extension-definition
+      namespace: default
+  properties:
+    # ------------------------------------------------------------------
+    # Hub-level surface
+    # ------------------------------------------------------------------
+    mcpEndpoint:
+      type: string
+      default: /mcp
+      description: |
+        Public path on the governed API where the virtual MCP endpoint is
+        served. Defaults to `/mcp`. The policy intercepts POST/GET to
+        this path and orchestrates calls to the configured upstream MCP
+        servers.
+    strictMode:
+      type: boolean
+      default: true
+      description: |
+        When true, requests that do not match the MCP endpoint are
+        short-circuited with a 404. When false, non-MCP requests fall
+        through to the configured Flex Gateway upstream.
+    collisionStrategy:
+      type: string
+      enum:
+        - prefix
+        - reject
+        - firstWins
+        - lastWins
+      default: prefix
+      description: |
+        How to handle duplicate tool / resource / prompt names across
+        upstream MCP servers when aggregating manifests.
+        - prefix: rename to `<serverName>.<originalName>` (default).
+        - reject: fail aggregation with an MCP-compliant error.
+        - firstWins: keep the first server's entry, drop subsequent dupes.
+        - lastWins: overwrite with the most recently seen entry.
+    aggregationTimeoutMs:
+      type: integer
+      minimum: 100
+      maximum: 60000
+      default: 5000
+      description: |
+        Per-upstream timeout (ms) when aggregating manifests
+        (`tools/list`, `resources/list`, `prompts/list`). Slow upstreams
+        are skipped with a warning rather than failing the aggregate.
+    perRequestTimeoutMs:
+      type: integer
+      minimum: 100
+      maximum: 600000
+      default: 30000
+      description: |
+        Per-upstream timeout (ms) for routed `tools/call`,
+        `resources/read`, `prompts/get` invocations.
+    manifestCacheTtlSeconds:
+      type: integer
+      minimum: 0
+      maximum: 86400
+      default: 60
+      description: |
+        TTL (seconds) for the in-memory aggregated manifest cache. After
+        this many seconds the next `tools/list`, `resources/list`, or
+        `prompts/list` re-aggregates from the upstream servers.
+    diagnosticContinueFlow:
+      type: boolean
+      default: false
+      description: |
+        Diagnostic only. When true the policy still performs aggregation /
+        routing, but returns Flow::Continue at the end of the request
+        handler instead of Flow::Break. Used to test runtime traps.
+        Leave false in production.
+
+    # ------------------------------------------------------------------
+    # Upstream MCP server registry
+    # ------------------------------------------------------------------
+    mcpServers:
+      type: array
+      description: |
+        Array of MCP server definitions. Each entry is an MCP Streamable
+        HTTP endpoint that the hub aggregates. Maximum 20 entries.
+      items:
+        type: object
+        properties:
+          name:
+            type: string
+            description: |
+              Logical server identifier. Used as the prefix when
+              `collisionStrategy=prefix` and as the routing key for
+              `<server>.<tool>` invocations. Must be unique.
+          endpoint:
+            type: string
+            format: service
+            description: |
+              MCP Streamable HTTP endpoint URL of the upstream MCP server.
+              Registered as a Flex Gateway upstream service.
+          enabled:
+            type: boolean
+            default: true
+            description: |
+              When false the server is skipped during aggregation and
+              routing. Useful for temporarily disabling a server without
+              removing its configuration.
+          authType:
+            type: string
+            enum:
+              - none
+              - bearerToken
+              - basicAuth
+              - apiKeyHeader
+              - customHeaders
+            default: none
+            description: |
+              Authentication strategy applied to outbound calls to this
+              MCP server.
+              - none: no auth header injected.
+              - bearerToken: `Authorization: Bearer <token>`.
+              - basicAuth: `Authorization: Basic base64(username:password)`.
+              - apiKeyHeader: `<headerName>: <apiKey>`.
+              - customHeaders: arbitrary headers from the `headers` array.
+          token:
+            type: string
+            format: password
+            description: |
+              Static bearer token. Required when `authType=bearerToken`.
+          username:
+            type: string
+            description: |
+              Basic auth username. Required when `authType=basicAuth`.
+          password:
+            type: string
+            format: password
+            description: |
+              Basic auth password. Required when `authType=basicAuth`.
+          headerName:
+            type: string
+            description: |
+              API-key header name (e.g. `x-api-key`). Required when
+              `authType=apiKeyHeader`.
+          apiKey:
+            type: string
+            format: password
+            description: |
+              API-key value. Required when `authType=apiKeyHeader`.
+          headers:
+            type: array
+            description: |
+              Additional HTTP headers attached to every outbound call to
+              this server. When `authType=customHeaders`, the auth
+              materials are sourced from this array.
+            items:
+              type: object
+              properties:
+                name:
+                  type: string
+                  description: HTTP header name.
+                value:
+                  type: string
+                  format: password
+                  description: HTTP header value.
+              required:
+                - name
+                - value
+          timeoutMs:
+            type: integer
+            minimum: 100
+            maximum: 600000
+            description: |
+              Per-server request timeout override. When unset the
+              policy-wide `perRequestTimeoutMs` is used.
+          priority:
+            type: integer
+            minimum: 0
+            maximum: 100
+            default: 50
+            description: |
+              Ordering hint when collisions occur with `firstWins` /
+              `lastWins`. Lower numbers are considered first.
+        required:
+          - name
+          - endpoint
+  required:
+    - mcpServers
