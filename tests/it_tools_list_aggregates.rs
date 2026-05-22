@@ -104,10 +104,17 @@ fn tools_list_aggregates_with_prefix_strategy() {
         .iter()
         .map(|t| t["name"].as_str().unwrap_or(""))
         .collect();
-    assert!(names.contains(&"jira.search"), "names={names:?}");
-    assert!(names.contains(&"slack.search"), "names={names:?}");
-    assert!(names.contains(&"jira.ticket"), "names={names:?}");
-    assert!(names.contains(&"slack.post"), "names={names:?}");
+    assert!(names.contains(&"jira_search"), "names={names:?}");
+    assert!(names.contains(&"slack_search"), "names={names:?}");
+    assert!(names.contains(&"jira_ticket"), "names={names:?}");
+    assert!(names.contains(&"slack_post"), "names={names:?}");
+    // All names must satisfy the MCP-client tool-name regex.
+    for n in &names {
+        assert!(
+            n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            "name '{n}' violates ^[a-zA-Z0-9_-]+$"
+        );
+    }
     assert_eq!(tools.len(), 4);
 
     // Internal markers must be stripped.

@@ -1,21 +1,27 @@
 //! MCP Hub policy entrypoint.
 //!
-//! Two-phase architecture (mirrors `acp-to-a2a`):
+//! Single-phase architecture: everything happens in the request filter.
 //!
-//! On request (`on_request`):
-//!   1. Match the inbound path against `mcpEndpoint` (defaults to `/mcp`).
-//!      Non-matches are short-circuited with 404 (strict) or passed
-//!      through (permissive).
-//!   2. For `GET /mcp` return a 200 placeholder describing the hub.
-//!      Some MCP clients probe with GET before POSTing.
-//!   3. For `POST /mcp` drain the body, parse the JSON-RPC envelope,
-//!      classify the method, and stash it as a [`McpPending`] for the
-//!      response phase to dispatch.
+//! 1. Match the inbound path against `mcpEndpoint` (defaults to `/mcp`).
+//!    Non-matches are short-circuited with 404 (strict) or returned as
+//!    `Flow::Continue(())` so the gateway's own upstream handles them.
+//! 2. `GET /mcp`: if the client advertises `Accept: text/event-stream`,
+//!    reply 200 with an immediate empty SSE stream so the EventSource
+//!    is happy (the hub never pushes server-initiated events). For
+//!    plain GETs (no SSE Accept) reply 405 with `Allow: POST`. Other
+//!    non-POST methods always get 405.
+//! 3. For `POST /mcp` drain the body, parse the JSON-RPC envelope, and
+//!    dispatch inline — local short-circuit (`initialize`, `ping`),
+//!    aggregate (`tools/list`, etc.), or route (`tools/call`, etc.) —
+//!    then `Flow::Break` with the synthesized response. Notifications
+//!    (no `id`) are fanned out best-effort and answered with 202.
 //!
-//! On response (`on_response`):
-//!   * Dispatch the [`McpPending`] — local short-circuit (`initialize`,
-//!     `ping`), aggregate (`tools/list`, etc.), or route (`tools/call`,
-//!     etc.) — and replace the upstream response via `send_response`.
+//! Why no response phase: when an API instance has no healthy upstream
+//! cluster (which is the normal case for a hub that synthesizes every
+//! response itself), Flex Gateway returns `503 no healthy upstream`
+//! before our response filter would have a chance to override the body
+//! via `send_response`. Breaking in the request phase bypasses the
+//! upstream-cluster check entirely.
 
 mod config;
 mod generated;
@@ -39,7 +45,7 @@ use crate::generated::config::Config;
 use crate::jsonrpc::{
     error_response, error_response_with_data, success_response, JsonRpcOutbound, JsonRpcRequest,
     INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND, PARSE_ERROR,
-    RESOURCE_NOT_FOUND, SERVER_UNAVAILABLE, TOOL_NOT_FOUND, PROMPT_NOT_FOUND,
+    PROMPT_NOT_FOUND, RESOURCE_NOT_FOUND, SERVER_UNAVAILABLE, TOOL_NOT_FOUND,
 };
 use crate::mcp::aggregate::{aggregate, resolve_owner, strip_internal, AggregateError, UpstreamItem};
 use crate::mcp::method::McpMethod;
@@ -66,33 +72,11 @@ struct PolicyState {
     upstream_sessions: Rc<RefCell<HashMap<String, String>>>,
 }
 
-/// Per-request work carried from request_filter to response_filter.
-#[derive(Clone, Debug)]
-enum McpPending {
-    /// Path didn't match the MCP endpoint and strictMode=false. Allow
-    /// the gateway's own upstream to handle the request.
-    PassThrough,
-    /// `GET /mcp` informational placeholder.
-    HubInfo,
-    /// JSON-RPC request to dispatch in the response phase.
-    Rpc {
-        request: JsonRpcRequest,
-        /// Inbound `mcp-session-id` header, if any. The hub mints one of
-        /// these on `initialize` and clients are expected to echo it.
-        client_session_id: Option<String>,
-    },
-    /// Body could not be parsed as JSON-RPC. Carry the error to
-    /// surface in the response phase.
-    ParseError {
-        id: Option<Value>,
-        message: String,
-    },
-}
-
 async fn request_filter(
     request: RequestHeadersState,
     state: PolicyState,
-) -> Flow<McpPending> {
+    client: HttpClient,
+) -> Flow<()> {
     let method = request.method();
     let path = request.path();
     let bare = path.split_once('?').map(|(p, _)| p).unwrap_or(&path).to_string();
@@ -102,18 +86,66 @@ async fn request_filter(
             logger::debug!("mcp-hub: rejecting non-MCP path '{}' (strictMode)", bare);
             return Flow::Break(make_text_response(404, "not found"));
         }
-        return Flow::Continue(McpPending::PassThrough);
+        // Permissive mode: let the gateway's upstream handle this path.
+        return Flow::Continue(());
     }
 
     let m = method.to_ascii_uppercase();
     if m == "GET" {
-        return Flow::Continue(McpPending::HubInfo);
+        // Streamable-HTTP clients open GET expecting a server-initiated
+        // SSE stream. The hub never pushes server-initiated events, but
+        // we still need to humour SSE-capable clients (MCP Inspector's
+        // legacy SSE fallback, EventSource probes) so they don't error
+        // out of the connection. Strategy:
+        //   * If the request advertises `Accept: text/event-stream`,
+        //     reply 200 with an immediate empty SSE stream (just a
+        //     keep-alive comment) so EventSource is satisfied.
+        //   * Otherwise reply 405 with `Allow: POST` so plain GETs
+        //     (browsers, health probes) get a clean spec-compliant
+        //     answer instead of an empty SSE.
+        let accepts_sse = request
+            .handler()
+            .headers()
+            .into_iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("accept"))
+            .any(|(_, v)| v.to_ascii_lowercase().contains("text/event-stream"));
+        if accepts_sse {
+            return Flow::Break(
+                Response::new(200)
+                    .with_headers(vec![
+                        ("content-type".into(), "text/event-stream".into()),
+                        ("cache-control".into(), "no-cache".into()),
+                        ("connection".into(), "keep-alive".into()),
+                    ])
+                    .with_body(b": mcp-hub-policy idle stream\n\n".to_vec()),
+            );
+        }
+        return Flow::Break(
+            Response::new(405)
+                .with_headers(vec![
+                    ("allow".into(), "POST".into()),
+                    ("content-type".into(), "application/json".into()),
+                ])
+                .with_body(error_response(
+                    None,
+                    INVALID_REQUEST,
+                    "method not allowed; use POST",
+                )),
+        );
     }
     if m != "POST" {
-        return Flow::Break(make_json_response(
-            405,
-            &error_response(None, INVALID_REQUEST, "method not allowed; use POST"),
-        ));
+        return Flow::Break(
+            Response::new(405)
+                .with_headers(vec![
+                    ("allow".into(), "POST".into()),
+                    ("content-type".into(), "application/json".into()),
+                ])
+                .with_body(error_response(
+                    None,
+                    INVALID_REQUEST,
+                    "method not allowed; use POST",
+                )),
+        );
     }
 
     if !request.contains_body() {
@@ -134,59 +166,28 @@ async fn request_filter(
     let body = body_state.handler().body().to_vec();
 
     let parsed: Result<JsonRpcRequest, _> = serde_json::from_slice(&body);
-    match parsed {
-        Ok(rpc) if rpc.jsonrpc != crate::jsonrpc::JSONRPC_VERSION => Flow::Continue(
-            McpPending::ParseError {
-                id: rpc.id,
-                message: format!("expected jsonrpc=2.0, got '{}'", rpc.jsonrpc),
-            },
-        ),
-        Ok(rpc) => Flow::Continue(McpPending::Rpc {
-            request: rpc,
-            client_session_id,
-        }),
-        Err(e) => Flow::Continue(McpPending::ParseError {
-            id: None,
-            message: format!("invalid JSON-RPC body: {e}"),
-        }),
-    }
-}
-
-async fn response_filter(
-    response: ResponseHeadersState,
-    state: PolicyState,
-    client: HttpClient,
-    data: RequestData<McpPending>,
-) {
-    let pending = match data {
-        RequestData::Continue(p) => p,
-        RequestData::Break | RequestData::Cancel => return,
+    let rpc = match parsed {
+        Ok(rpc) if rpc.jsonrpc != crate::jsonrpc::JSONRPC_VERSION => {
+            return Flow::Break(make_json_response(
+                200,
+                &error_response(
+                    rpc.id,
+                    PARSE_ERROR,
+                    &format!("expected jsonrpc=2.0, got '{}'", rpc.jsonrpc),
+                ),
+            ));
+        }
+        Ok(rpc) => rpc,
+        Err(e) => {
+            return Flow::Break(make_json_response(
+                200,
+                &error_response(None, PARSE_ERROR, &format!("invalid JSON-RPC body: {e}")),
+            ));
+        }
     };
 
-    match pending {
-        McpPending::PassThrough => {
-            // Let the gateway's upstream response flow through unchanged.
-        }
-        McpPending::HubInfo => {
-            response.send_response(make_json_response(
-                200,
-                &serde_json::to_vec(&hub_info_payload(&state)).unwrap_or_default(),
-            ));
-        }
-        McpPending::ParseError { id, message } => {
-            response.send_response(make_json_response(
-                200,
-                &error_response(id, PARSE_ERROR, &message),
-            ));
-        }
-        McpPending::Rpc {
-            request: rpc,
-            client_session_id,
-        } => {
-            let resp = dispatch_rpc(&state, &client, rpc, client_session_id).await;
-            response.send_response(resp);
-        }
-    }
+    let resp = dispatch_rpc(&state, &client, rpc, client_session_id).await;
+    Flow::Break(resp)
 }
 
 async fn dispatch_rpc(
@@ -201,9 +202,11 @@ async fn dispatch_rpc(
 
     if rpc.is_notification() {
         // Notifications are best-effort: fan out to all enabled upstreams,
-        // ignore errors, return 204.
+        // ignore errors, return 202 Accepted (no body) per MCP Streamable
+        // HTTP spec. 204 trips undici's null-body-status check in the
+        // MCP Inspector proxy.
         fan_out_notification(state, client, &rpc).await;
-        return make_response(204, b"");
+        return make_response(202, b"");
     }
 
     let id_value = id.clone().unwrap_or(Value::Null);
@@ -609,18 +612,29 @@ fn mint_session_id() -> String {
     )
 }
 
-/// Resolve owner for the prefix-strategy fast path: split `name` on the
-/// first `.` and verify the first segment is a configured server.
+/// Resolve owner for the prefix-strategy fast path. The aggregator joins
+/// `<server>_<tool>`, but `_` can appear inside both server names (e.g.
+/// `jira_dev`) and tool names (e.g. `list_issues`). To disambiguate, we
+/// pick the longest configured server name that the requested string
+/// starts with, followed by `_`.
 fn resolve_owner_fast(state: &PolicyState, requested: &str) -> Option<(String, String)> {
     if state.cfg.collision_strategy != CollisionStrategy::Prefix {
         return None;
     }
-    let (server, rest) = requested.split_once('.')?;
-    if state.cfg.server(server).is_some() {
-        Some((server.to_string(), rest.to_string()))
-    } else {
-        None
+    let mut best: Option<(&str, usize)> = None;
+    for server in state.cfg.servers.iter().map(|s| s.name.as_str()) {
+        let plen = server.len() + 1;
+        if requested.len() <= plen {
+            continue;
+        }
+        if requested.starts_with(server) && requested.as_bytes()[server.len()] == b'_' {
+            if best.map(|(_, l)| plen > l).unwrap_or(true) {
+                best = Some((server, plen));
+            }
+        }
     }
+    let (server, plen) = best?;
+    Some((server.to_string(), requested[plen..].to_string()))
 }
 
 /// Slow-path resolver: re-aggregate the relevant `*list` manifest and
@@ -737,26 +751,6 @@ fn upstream_error_code(err: &UpstreamError) -> i32 {
     }
 }
 
-fn hub_info_payload(state: &PolicyState) -> Value {
-    let servers: Vec<Value> = state
-        .cfg
-        .enabled_servers()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name,
-                "priority": s.priority,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "name": HUB_NAME,
-        "version": HUB_VERSION,
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "endpoint": state.cfg.mcp_endpoint,
-        "servers": servers,
-    })
-}
-
 /// Match the inbound URL path to the configured MCP endpoint. We accept
 /// any path that *contains* the endpoint as a suffix-or-segment, so
 /// API Manager can mount the policy at an arbitrary prefix
@@ -858,18 +852,10 @@ pub async fn configure(
         upstream_sessions: Rc::new(RefCell::new(HashMap::new())),
     };
 
-    let request_state = state.clone();
-    let response_state = state;
-    let filter = on_request(move |request: RequestHeadersState, _client: HttpClient| {
-        let s = request_state.clone();
-        async move { request_filter(request, s).await }
-    })
-    .on_response(
-        move |response, client: HttpClient, data: RequestData<McpPending>| {
-            let s = response_state.clone();
-            async move { response_filter(response, s, client, data).await }
-        },
-    );
+    let filter = on_request(move |request: RequestHeadersState, client: HttpClient| {
+        let s = state.clone();
+        async move { request_filter(request, s, client).await }
+    });
 
     launcher.launch(filter).await?;
     Ok(())

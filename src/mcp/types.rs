@@ -21,12 +21,18 @@ pub fn server_info(name: &str, version: &str) -> serde_json::Value {
 /// MCP `initialize` capabilities block. The hub advertises the union of
 /// supported feature areas — clients infer support from the manifests
 /// returned by the corresponding `*list` calls.
+///
+/// We deliberately do NOT advertise `logging` here: declaring the
+/// capability obliges the server to implement `logging/setLevel`, and
+/// the hub doesn't expose client-controllable logging. MCP Inspector
+/// (and other strict clients) errors with "Server declares logging
+/// capability but doesn't implement method: 'logging/setLevel'" when
+/// the capability is advertised without the method.
 pub fn server_capabilities() -> serde_json::Value {
     serde_json::json!({
         "tools": { "listChanged": false },
         "resources": { "listChanged": false, "subscribe": false },
         "prompts": { "listChanged": false },
-        "logging": {},
     })
 }
 
@@ -47,5 +53,21 @@ mod tests {
         assert!(v.get("tools").is_some());
         assert!(v.get("resources").is_some());
         assert!(v.get("prompts").is_some());
+    }
+
+    #[test]
+    fn capabilities_must_not_advertise_unsupported_methods() {
+        // Each advertised capability obliges the hub to implement its
+        // associated method(s). We do not implement any of these, so
+        // they must not appear here. Regressing this trips MCP Inspector
+        // with "Server declares X capability but doesn't implement
+        // method: ...".
+        let v = server_capabilities();
+        for cap in ["logging", "completions", "experimental"] {
+            assert!(
+                v.get(cap).is_none(),
+                "must not advertise '{cap}' without implementing its methods"
+            );
+        }
     }
 }

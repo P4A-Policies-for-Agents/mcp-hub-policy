@@ -40,7 +40,8 @@ fn strict_mode_rejects_non_mcp_paths() {
 }
 
 #[test]
-fn get_on_mcp_returns_hub_info() {
+fn plain_get_on_mcp_returns_405() {
+    // Plain GET (browser, health probe, no SSE Accept) → 405 + Allow: POST.
     let upstream = RouterBackend::new(|_req| json(500, "should not be called"));
 
     let mut tester = UnitTestBuilder::default()
@@ -51,10 +52,39 @@ fn get_on_mcp_returns_hub_info() {
     let req = UnitHttpRequest::get().with_path("/mcp");
     let resp = tester.request(req);
 
+    assert_eq!(resp.status_code(), 405);
+    let allow = resp
+        .headers()
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("allow"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(allow, "POST");
+}
+
+#[test]
+fn sse_get_on_mcp_returns_event_stream() {
+    // SSE clients (MCP Inspector legacy fallback, EventSource probes)
+    // send `Accept: text/event-stream`. Respond 200 with an empty SSE
+    // stream so the client connects without error.
+    let upstream = RouterBackend::new(|_req| json(500, "should not be called"));
+
+    let mut tester = UnitTestBuilder::default()
+        .with_config(policy_config())
+        .with_http_upstream_from_authority("upstream.test", upstream)
+        .with_entrypoint(configure);
+
+    let req = UnitHttpRequest::get()
+        .with_path("/mcp")
+        .with_header("accept", "text/event-stream");
+    let resp = tester.request(req);
+
     assert_eq!(resp.status_code(), 200);
-    let v: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
-    assert_eq!(v["name"], "mcp-hub-policy");
-    let servers = v["servers"].as_array().expect("servers array");
-    assert_eq!(servers.len(), 1);
-    assert_eq!(servers[0]["name"], "jira");
+    let ct = resp
+        .headers()
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert_eq!(ct, "text/event-stream");
 }

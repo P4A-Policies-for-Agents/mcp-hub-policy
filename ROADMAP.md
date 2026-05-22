@@ -4,6 +4,27 @@ Items intentionally deferred from v1 (`mcp-hub-policy` 0.1.0) and ideas
 for future directions. Each entry includes the requirement section it
 came from where applicable.
 
+For per-version release notes see [`CHANGELOG.md`](CHANGELOG.md).
+
+## v0.2.x (shipped — first MCP-client-compatible release)
+
+End-to-end working with Claude Desktop, MCP Inspector, ChatGPT
+Desktop, Postman, and any conformant Streamable-HTTP client. See the
+changelog for the per-version breakdown; the headline fixes vs 0.1.0:
+
+- **Single-phase dispatch** (`request_filter` `Flow::Break`s with the
+  synthesized response). Bypasses Flex Gateway's upstream-cluster
+  check so the hub no longer needs a healthy backend (0.2.1).
+- **Spec-compliant Streamable HTTP**: `notifications/*` → 202,
+  unsupported methods → 405 + `Allow: POST`, GET with SSE Accept →
+  200 + `text/event-stream` empty stub stream (0.2.2 / 0.2.3).
+- **Tool-name regex compliance**: prefix separator switched from `.`
+  to `_` so names match `^[a-zA-Z0-9_-]{1,64}$` (Claude Desktop /
+  OpenAI tool-calling) (0.2.3).
+- **Capabilities cleanup**: removed `logging` from advertised
+  capabilities — declaring it without implementing
+  `logging/setLevel` tripped MCP Inspector (0.2.4).
+
 ## v1 (shipped, 0.1.0)
 
 - Virtual `/mcp` endpoint with suffix-match path (REQ §6.1).
@@ -15,7 +36,7 @@ came from where applicable.
   configurable collision strategy (`prefix`, `reject`, `firstWins`,
   `lastWins`) (REQ §6.7, §6.8).
 - `tools/call` / `resources/read` / `prompts/get` routing — fast path
-  via `<server>.<name>` prefix; slow path via re-aggregation when the
+  via `<server>_<name>` prefix; slow path via re-aggregation when the
   collision strategy is not `prefix` (REQ §6.9).
 - Local handshake (`initialize`) with merged capabilities + hub-owned
   `serverInfo` (REQ §5).

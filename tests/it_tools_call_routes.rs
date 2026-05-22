@@ -1,7 +1,7 @@
 // Copyright 2026 Salesforce, Inc. All rights reserved.
 
 //! `tools/call` routes to the owning upstream by inspecting the
-//! `<server>.<tool>` prefix. The original (un-prefixed) name is forwarded
+//! `<server>_<tool>` prefix. The original (un-prefixed) name is forwarded
 //! to the upstream.
 
 mod common;
@@ -80,7 +80,7 @@ fn tools_call_dispatches_to_owning_upstream_with_unprefixed_name() {
         "id": 7,
         "method": "tools/call",
         "params": {
-            "name": "jira.search",
+            "name": "jira_search",
             "arguments": {"q": "fix bug"}
         }
     })
@@ -129,7 +129,7 @@ fn tools_call_unknown_server_returns_tool_not_found() {
         "jsonrpc": "2.0",
         "id": "call-1",
         "method": "tools/call",
-        "params": {"name": "ghost.search"}
+        "params": {"name": "ghost_search"}
     })
     .to_string();
 

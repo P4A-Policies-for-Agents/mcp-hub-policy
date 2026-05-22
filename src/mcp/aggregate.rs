@@ -54,7 +54,10 @@ pub fn aggregate(
 
         match strategy {
             CollisionStrategy::Prefix => {
-                let prefixed = format!("{server}.{original_name}");
+                // Use `_` as the separator. MCP clients (Claude Desktop, OpenAI
+                // function-calling, etc.) constrain tool names to
+                // `^[a-zA-Z0-9_-]{1,64}$`, which forbids `.`.
+                let prefixed = format!("{server}_{original_name}");
                 entry["name"] = Value::String(prefixed.clone());
                 if seen.iter().any(|(n, _)| n == &prefixed) {
                     // Two servers prefixed to the same name (same server
@@ -158,14 +161,21 @@ mod tests {
     }
 
     #[test]
-    fn prefix_renames_with_server_dot_name() {
+    fn prefix_renames_with_server_underscore_name() {
         let items = vec![item("jira", "search"), item("slack", "search")];
         let out = aggregate(items, CollisionStrategy::Prefix).unwrap();
         let names: Vec<_> = out
             .iter()
             .map(|v| v["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["jira.search", "slack.search"]);
+        assert_eq!(names, vec!["jira_search", "slack_search"]);
+        // Sanity-check the MCP-client regex.
+        for n in &names {
+            assert!(
+                n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "name '{n}' violates ^[a-zA-Z0-9_-]+$"
+            );
+        }
     }
 
     #[test]
@@ -195,7 +205,7 @@ mod tests {
     fn resolve_owner_strips_prefix() {
         let items = vec![item("jira", "search"), item("slack", "list")];
         let out = aggregate(items, CollisionStrategy::Prefix).unwrap();
-        let hint = resolve_owner(&out, "jira.search").unwrap();
+        let hint = resolve_owner(&out, "jira_search").unwrap();
         assert_eq!(hint.server, "jira");
         assert_eq!(hint.original_name, "search");
     }
@@ -207,6 +217,6 @@ mod tests {
         let cleaned = strip_internal(out);
         assert!(cleaned[0].get("_origin").is_none());
         assert!(cleaned[0].get("_originalName").is_none());
-        assert_eq!(cleaned[0]["name"], "jira.search");
+        assert_eq!(cleaned[0]["name"], "jira_search");
     }
 }
