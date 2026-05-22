@@ -12,7 +12,7 @@ metadata:
       `tools/call`, `resources/read`, `prompts/get` to the owning server.
       Per-server authentication and arbitrary headers are configured
       declaratively in API Manager.
-    category: AI
+    category: MCP
     metadata/interfaceScope: api,resource
     metadata/capabilities/injectionPoint: inbound
 spec:

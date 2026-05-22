@@ -4,6 +4,14 @@ All notable changes to `mcp-hub-policy`. The 0.2.x line is the first
 shippable, MCP-client-compatible release; 0.1.0 was an internal
 preview.
 
+## [0.2.5] — 2026-05-22
+
+### Changed
+
+- Exchange asset category changed from `AI` to `MCP` so the policy
+  surfaces in the MCP category in Anypoint Exchange / API Manager
+  (no behavioural change).
+
 ## [0.2.4] — 2026-05-22
 
 ### Fixed

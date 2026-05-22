@@ -1,7 +1,7 @@
 # Copyright 2026 Salesforce, Inc. All rights reserved.
 [package]
 name = "mcp_hub"
-version = "0.2.4"
+version = "0.2.5"
 rust-version = "1.88.0"
 edition = "2021"
 
