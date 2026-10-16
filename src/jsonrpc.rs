@@ -22,6 +22,7 @@ pub const SERVER_UNAVAILABLE: i32 = -32010;
 pub const TOOL_NOT_FOUND: i32 = -32011;
 pub const RESOURCE_NOT_FOUND: i32 = -32012;
 pub const PROMPT_NOT_FOUND: i32 = -32013;
+pub const AUTH_REQUIRED: i32 = -32014;
 
 /// Inbound JSON-RPC request from the MCP client.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -42,11 +43,13 @@ impl JsonRpcRequest {
 }
 
 /// Outbound JSON-RPC request envelope written when the hub is the client
-/// (egress to an upstream MCP server).
+/// (egress to an upstream MCP server). `id` is `None` for notifications,
+/// which JSON-RPC 2.0 requires to omit the member entirely.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcOutbound {
     pub jsonrpc: &'static str,
-    pub id: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<serde_json::Value>,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
@@ -60,7 +63,16 @@ impl JsonRpcOutbound {
     ) -> Self {
         Self {
             jsonrpc: JSONRPC_VERSION,
-            id: id.into(),
+            id: Some(id.into()),
+            method: method.into(),
+            params,
+        }
+    }
+
+    pub fn notification(method: impl Into<String>, params: Option<serde_json::Value>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION,
+            id: None,
             method: method.into(),
             params,
         }
@@ -157,6 +169,16 @@ mod tests {
     }
 
     #[test]
+    fn outbound_notification_omits_id() {
+        let req = JsonRpcOutbound::notification("notifications/initialized", None);
+        let v: serde_json::Value = serde_json::from_slice(&req.into_bytes()).unwrap();
+        assert!(
+            v.get("id").is_none(),
+            "notifications must not carry an id: {v}"
+        );
+    }
+
+    #[test]
     fn request_is_notification_when_id_missing() {
         let req: JsonRpcRequest =
             serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
@@ -166,7 +188,11 @@ mod tests {
 
     #[test]
     fn error_response_includes_code_and_message() {
-        let bytes = error_response(Some(serde_json::json!(7)), METHOD_NOT_FOUND, "no such method");
+        let bytes = error_response(
+            Some(serde_json::json!(7)),
+            METHOD_NOT_FOUND,
+            "no such method",
+        );
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"]["code"], METHOD_NOT_FOUND);
         assert_eq!(v["error"]["message"], "no such method");

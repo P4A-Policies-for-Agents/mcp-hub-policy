@@ -1,147 +1,175 @@
 # MCP Hub Policy
+_Single endpoint for multiple MCP Servers_
 
-Aggregates multiple upstream **MCP** (Model Context Protocol) servers
-behind a single virtual `/mcp` endpoint. Built on PDK 1.8
-(Rust → WebAssembly) for MuleSoft Flex Gateway / Omni Gateway.
+A custom **MuleSoft Flex Gateway / Omni Gateway** policy that turns multiple MCP servers into one **virtual MCP aggregation endpoint**. AI agents and MCP clients connect to a single `/mcp` URL; the policy talks to every configured upstream MCP server, merges their tool, resource and prompt manifests, applies per-server authentication — including forwarding the end user's own token where an upstream needs it — and routes each invocation to the server that owns it.
 
-After the policy is applied, MCP clients (Claude Desktop, MCP Inspector,
-ChatGPT Desktop, Postman, custom agents) connect to one MCP endpoint
-that fans out across every configured upstream. Tool, resource, and
-prompt manifests are merged on the wire; per-server authentication,
-custom headers, and timeouts are applied transparently.
+Built with [PDK 1.8](https://docs.mulesoft.com/pdk/latest/policies-pdk-overview) (Rust → WebAssembly). Requires Flex Gateway 1.6.1 or later.
 
-## Apply this policy to an MCP-typed API instance
+---
 
-Create the API instance in API Manager with **type = MCP**. The hub
-itself is the MCP endpoint — the upstream URI on the instance is
-**never used**, so any reachable URL satisfies API Manager's validation
-(common choice: `https://anypoint.mulesoft.com`). Every recognized
-request is short-circuited in the policy's request phase, so the
-upstream is never contacted.
+## Purpose
+
+Model Context Protocol (MCP) is the emerging standard that LLM-based agents (Claude Desktop, Cursor, Cline, MCP Inspector, ChatGPT Desktop, ServiceNow's agent runtime, etc.) use to discover and invoke tools. Each enterprise MCP server exposes its own catalogue, its own auth and its own URL. As soon as you have more than one — an ERP server, a CRM server, a knowledge-base server — every client needs a separate connection per server, and every server has to be exposed individually through your gateway.
+
+`mcp-hub-policy` removes both problems. It runs inside Flex Gateway as a custom policy and presents one MCP endpoint to clients. Internally it speaks MCP Streamable HTTP to each upstream, fanning out the discovery calls (`tools/list`, `resources/list`, `prompts/list`) and routing the invocation calls (`tools/call`, `resources/read`, `prompts/get`) to the right backend.
+
+## Features
+
+- **One endpoint, up to 50 MCP servers.** Clients see a single `/mcp` URL and one combined tool catalogue.
+- **Declarative configuration in API Manager.** Add, remove or disable an upstream MCP server by editing the policy configuration — no code changes, no redeploys.
+- **Per-server authentication.** Each upstream uses its own scheme: `none`, `bearerToken`, `basicAuth`, `apiKeyHeader`, `customHeaders` or `passthrough`. Static secrets stay out of clients.
+- **Masked secrets.** `token`, `password`, `apiKey` and every `headers[].value` are `security:sensitive`: API Manager masks them while you type and does not show the stored value again.
+- **Per-user token passthrough.** `authType: passthrough` forwards the caller's `Authorization` header (or the header named in `headerName`) to that upstream only, so JWT-secured MCP servers authorize each end user with their own identity.
+- **Mixed-auth aggregation.** `tools/list` returns everything from the upstreams that answered; upstreams that need a token the caller didn't send, or rejected it, are skipped.
+- **OAuth-ready challenges.** A routed call to a passthrough upstream without a valid token returns HTTP 401/403 with `WWW-Authenticate`, so MCP clients can start their OAuth flow. Optional protected-resource metadata (RFC 9728) is served by the policy.
+- **Fast discovery.** `*/list` calls query all upstreams concurrently, and each upstream's answer is cached for `manifestCacheTtlSeconds` (per caller for `passthrough` servers).
+- **Collision handling.** Two upstreams advertising the same name are disambiguated automatically (default: prefix with the server name).
+- **Spec-compliant MCP Streamable HTTP.** Protocol-version negotiation, `notifications/initialized` (202), `GET` for SSE clients, stateless client sessions, and tool names that match `^[a-zA-Z0-9_-]{1,64}$`.
+- **Upstream session management.** Upstream MCP sessions are reused per server (and per user for passthrough), expire after a TTL, and are re-established automatically when an upstream forgets them.
+- **Operational safety.** Slow, failing or unauthorized upstreams are skipped during aggregation; routed calls have per-request timeouts; errors are returned as MCP-compliant JSON-RPC errors or, for authentication, HTTP 401/403.
+
+## Business benefits
+
+| Benefit | What it means in practice |
+|---|---|
+| **Faster agent rollout** | Onboard a new MCP-enabled app in minutes by editing API Manager config, instead of pushing connection updates to every client. |
+| **One governed front door** | API Manager owns auth, throttling, logging and policy chaining for the entire MCP fleet — your agents never get raw access to backend MCP servers. |
+| **Safe credential boundary** | Static secrets live only in the policy config, in masked fields — never in client config. User tokens reach only the upstreams configured for `passthrough`. |
+| **User-level authorization** | JWT-secured MCP servers authorize each end user with their own token instead of a shared service credential. |
+| **Vendor-neutral agents** | Any MCP-conformant client works against the hub — no client-specific connectors required. |
+| **Pay-as-you-grow tool catalogue** | Add a new MCP server without reconfiguring agents — the next `tools/list` call surfaces its tools automatically. |
+| **Centralized observability** | Every MCP call traverses Flex Gateway — use the platform's existing telemetry instead of stitching logs from N MCP servers. |
+
+---
+
+## Set up
+
+1. In API Manager create an API instance with **type = MCP** on your Flex Gateway. The hub itself is the MCP endpoint: the instance's upstream URI is never called, so any reachable URL satisfies API Manager's validation (for example `https://anypoint.mulesoft.com`).
+2. Apply **MCP Hub Policy** to the instance with a configuration like the one below.
+3. Point MCP clients at `https://<gateway-host>/<api-path>/mcp` — for MCP Inspector use transport **streamable-http**.
+
+## Configuration
+
+```yaml
+mcpEndpoint:          /mcp
+strictMode:           true
+collisionStrategy:    prefix            # prefix | reject | firstWins | lastWins
+
+# Only needed when using authType: passthrough
+resourceUrl:          https://<gateway-host>/<api-path>/mcp
+authorizationServers: [https://<your-idp>/oauth2/<server-id>]
+scopesSupported:      []                # optional
+
+mcpServers:
+  - name:     kb                        # public server, no auth
+    endpoint: https://kb-mcp.example.com/mcp
+    enabled:  true
+    authType: none
+
+  - name:     erp                       # static service credential
+    endpoint: https://erp-mcp.example.com/mcp
+    enabled:  true
+    authType: bearerToken
+    token:    <erp-service-token>       # masked in API Manager
+
+  - name:     escalate                  # validates the end user's JWT
+    endpoint: https://<gateway-host>/devops-escalation-mcp/mcp
+    enabled:  true
+    authType: passthrough               # forwards the caller's Authorization
+```
+
+Each `mcpServers` entry needs a unique `name` and an `endpoint`. Use letters, digits, `_` and `-` in names, and avoid names where one is the other plus `_…` (for example `jira` and `jira_dev`), because the name becomes the tool prefix.
+
+### Per-server authentication
+
+| `authType`      | Required fields          | Header(s) sent to the upstream |
+|-----------------|--------------------------|--------------------------------|
+| `none`          | —                        | none |
+| `bearerToken`   | `token`                  | `Authorization: Bearer <token>` |
+| `basicAuth`     | `username`, `password`   | `Authorization: Basic …` |
+| `apiKeyHeader`  | `headerName`, `apiKey`   | `<headerName>: <apiKey>` |
+| `customHeaders` | `headers` array          | every entry of `headers` |
+| `passthrough`   | — (optional `headerName`)| the caller's `<headerName>` (default `Authorization`), unchanged |
+
+Enter static secrets as literal values; the policy does not resolve `${secure::...}` or other property placeholders.
+
+The `headers` array is always added on top of the auth scheme — use it for tenant headers, environment markers or other metadata. For `passthrough`, a `headers` entry with the same name as the passthrough header overrides the caller's value. Transport headers (`host`, `content-type`, `mcp-session-id`, `mcp-protocol-version`, …) cannot be passed through.
+
+### Mixed authentication — what clients see
+
+| Request | Caller sends a valid token | Caller sends no / invalid token |
+|---|---|---|
+| `initialize`, `ping` | 200 | 200 |
+| `tools/list` (and other `*/list`) | entries from **all** upstreams | entries from upstreams that don't need the caller's token |
+| `tools/call` → static / no-auth upstream | routed | routed |
+| `tools/call` → `passthrough` upstream | routed with the caller's token | **HTTP 401** + `WWW-Authenticate` |
+
+When `authorizationServers` is configured, `WWW-Authenticate` points at the metadata the policy serves at `<resourceUrl>/.well-known/oauth-protected-resource`; otherwise the upstream's own challenge is relayed.
+
+### Collision strategies
+
+| Strategy | Behaviour |
+|---|---|
+| `prefix` (default) | Rename to `<server>_<name>`; both entries are kept. `tools/call` accepts the prefixed name and sends the original name upstream. |
+| `reject` | Fail aggregation with an `INTERNAL_ERROR` JSON-RPC error. |
+| `firstWins` | Keep the first server's entry, drop later duplicates. |
+| `lastWins` | Keep the last server's entry. |
+
+Servers are ordered by `priority` (lower first), then by configuration order; with `firstWins` / `lastWins` this decides which server wins.
+
+### Other settings
+
+| Property | Default | Purpose |
+|---|---|---|
+| `mcpEndpoint` | `/mcp` | Path the hub serves, matched as a suffix — if the API is mounted at `/api/v1`, the hub answers at `/api/v1/mcp`. |
+| `strictMode` | `true` | `true`: requests that don't hit `mcpEndpoint` get 404. `false`: they continue to the API's upstream, so the policy can share an instance. |
+| `aggregationTimeoutMs` | `5000` | Timeout for each upstream's `*/list` call (upstreams are queried concurrently). Setting up a new upstream session uses `perRequestTimeoutMs`. |
+| `perRequestTimeoutMs` | `30000` | Timeout for routed calls; override per server with `timeoutMs`. |
+| `upstreamSessionTtlSeconds` | `1800` | How long an upstream MCP session is reused (per server, per user for `passthrough`). `0` disables reuse. |
+| `allowedOrigins` | empty | If set, requests whose `Origin` is not listed get HTTP 403. Empty = rely on a gateway CORS policy. |
+| `manifestCacheTtlSeconds` | `60` | How long each upstream's `*/list` answer is reused (per server, per user for `passthrough`). Failed answers and answers over 64 KB are not cached. `0` disables the cache. |
+| `diagnosticContinueFlow` | `false` | Deprecated and ignored. |
 
 ## Methods served
 
-The policy speaks the **MCP Streamable HTTP** transport on the
-configured `mcpEndpoint` (default `/mcp`):
+| JSON-RPC method | Behaviour |
+|---|---|
+| `initialize` | Answered by the hub; negotiates `protocolVersion` (`2025-06-18`, `2025-03-26`, `2024-11-05`). Stateless: no `mcp-session-id` is issued. |
+| `ping` | Answered by the hub. |
+| `tools/list`, `resources/list`, `prompts/list` | Aggregated from every enabled upstream, with the collision strategy applied. |
+| `tools/call`, `prompts/get` | Routed to the upstream that owns the name. |
+| `resources/read` | Routed to the upstream whose `resources/list` contains the `uri`. |
+| `notifications/*` | HTTP 202; forwarded best-effort to passthrough upstreams where the caller has a session. |
+| anything else | `METHOD_NOT_FOUND` JSON-RPC error. |
 
-| JSON-RPC method      | Behaviour                                                                |
-|----------------------|--------------------------------------------------------------------------|
-| `initialize`         | Local handshake — hub identifies itself and mints `mcp-session-id`       |
-| `ping`               | Local 200 (liveness probe)                                               |
-| `tools/list`         | Aggregate from every enabled upstream; apply `collisionStrategy`         |
-| `tools/call`         | Route to the upstream that owns the named tool                           |
-| `resources/list`     | Aggregate                                                                |
-| `resources/read`     | Route                                                                    |
-| `prompts/list`       | Aggregate                                                                |
-| `prompts/get`        | Route                                                                    |
-| `notifications/*`    | Best-effort fan-out → **202 Accepted** (no body)                         |
-| _(unknown method)_   | `METHOD_NOT_FOUND` JSON-RPC error                                        |
+`GET /mcp` with `Accept: text/event-stream` gets an empty SSE stream; other `GET`s get 405. An unsupported `MCP-Protocol-Version` header gets HTTP 400. The hub advertises only the `tools`, `resources` and `prompts` capabilities.
 
-`GET /mcp` serves the SSE-fallback path used by some clients (MCP
-Inspector legacy SSE, EventSource probes): if the request advertises
-`Accept: text/event-stream` the policy answers 200 with an immediate
-empty SSE stream; otherwise it returns 405 + `Allow: POST`.
+## Limits and known limitations
 
-## Quick start
+- **Up to 50 servers** per policy.
+- **Discovery latency** is set by the slowest upstream when the cache is cold, and is fast while cached answers are fresh. In a 50-server test on CloudHub (public MCP servers), a cold `tools/list` took about 0.5–5 s and a cached one about 0.1–0.3 s. Each gateway replica has its own cache, so a request served by another replica can be slow again.
+- **Cached lists can be up to `manifestCacheTtlSeconds` old.** A tool added or removed on an upstream appears after the cached answer expires; set `0` if lists must always be live. Cached `passthrough` lists are served without asking the upstream to re-check the caller's token, so a revoked token can still see the list until it expires; routed calls always go to the upstream with the caller's token.
+- **`resources/read`** works for URIs that appear in an upstream's `resources/list`. Resource templates (`resources/templates/list`) are not aggregated. If two servers list the same URI, the first by `priority` receives the read. Resources on `passthrough` servers are found only when the caller sends a token; without one the read returns `RESOURCE_NOT_FOUND` (`-32012`), not HTTP 401, so it does not start the client's OAuth login.
+- **Pagination:** only the first page of each upstream's list is returned.
+- **SSE upstreams:** responses are buffered, not streamed. Progress and log notifications an upstream sends before its result are dropped.
 
-Minimal config — front three MCP servers, prefix any colliding tool
-names with the server name:
+## Security notes
 
-```yaml
-config:
-  mcpEndpoint:        /mcp
-  strictMode:         true
-  collisionStrategy:  prefix          # prefix | reject | firstWins | lastWins
+- **Token passthrough** sends the caller's token unchanged. Each `passthrough` upstream must accept tokens issued for the hub, and any of them could replay a token against the others. The MCP authorization specification discourages token passthrough; use it when the hub and its upstreams share an authorization server and trust boundary.
+- The hub does not validate inbound tokens itself. To require authentication for **every** request (including `initialize` and `tools/list`), apply a JWT Validation policy ahead of this policy.
+- Logging policies that record request headers will record user tokens; exclude `Authorization` from logged headers.
+- Upstream error messages are relayed to clients and may contain internal host names.
 
-  mcpServers:
-    - name:           erp
-      endpoint:       https://erp-mcp.example.com/mcp
-      enabled:        true
-      authType:       bearerToken
-      token:          ${secure::erp.token}
+---
 
-    - name:           crm
-      endpoint:       https://crm-mcp.example.com/mcp
-      enabled:        true
-      authType:       apiKeyHeader
-      headerName:     x-api-key
-      apiKey:         ${secure::crm.key}
+## Details
 
-    - name:           kb
-      endpoint:       https://kb-mcp.example.com/mcp
-      enabled:        true
-      authType:       none
-```
+- **Category** — MCP
+- **Maintainer** — Amir Khan
+- **Version** — 0.3.x
+- **Release notes** — `CHANGELOG.md` in the source repository
 
-Required fields: a non-empty `mcpServers` array; each entry needs
-`name` and `endpoint`. Everything else has sensible defaults.
+## Links
 
-## Per-server authentication
-
-The hub picks the auth scheme per upstream from the configured
-`authType`:
-
-| `authType`       | Required fields                  | Header(s) emitted                         |
-|------------------|----------------------------------|-------------------------------------------|
-| `none`           | (none)                           | (no auth header)                          |
-| `bearerToken`    | `token`                          | `Authorization: Bearer <token>`           |
-| `basicAuth`      | `username`, `password`           | `Authorization: Basic base64(u:p)`        |
-| `apiKeyHeader`   | `headerName`, `apiKey`           | `<headerName>: <apiKey>`                  |
-| `customHeaders`  | (use `headers` array)            | every entry from the `headers` array      |
-
-The `headers` array is always honoured on top of the auth scheme — use
-it for tenant headers, environment markers, or any non-auth metadata
-the upstream expects (`x-env: prod`, `x-tenant: acme`, etc.).
-
-## Collision strategies
-
-Every `*list` method merges manifests from every enabled upstream. When
-two upstreams advertise the same name, the configured `collisionStrategy`
-decides what to do:
-
-| Strategy     | Behaviour                                                                            |
-|--------------|--------------------------------------------------------------------------------------|
-| `prefix`     | Rename to `<serverName>_<originalName>` (default). Both entries kept.                |
-| `reject`     | Fail aggregation with an `INTERNAL_ERROR` JSON-RPC error.                            |
-| `firstWins`  | Keep the first upstream's entry, drop subsequent dupes.                              |
-| `lastWins`   | Overwrite with the most recently seen entry.                                         |
-
-The prefix uses `_` (not `.`) because MCP clients including Claude
-Desktop and OpenAI's tool-calling validate names against
-`^[a-zA-Z0-9_-]{1,64}$`. With `prefix`, `tools/call` accepts the
-`<server>_<tool>` form on the inbound side and forwards the original
-(un-prefixed) name to the upstream so the upstream sees its native
-namespace.
-
-## Behaviour in practice
-
-- **Slow / failing upstreams** during aggregation are logged and
-  skipped — partial degradation is preferred over total failure.
-  `aggregationTimeoutMs` (default 5s) caps each upstream's contribution.
-- **Per-call timeouts** during routed `tools/call` etc. default to
-  `perRequestTimeoutMs` (30s) and may be overridden per server with
-  `timeoutMs`.
-- **Streaming** responses (`text/event-stream`, chunked) are accepted
-  by the hub on the outbound `Accept`, but in v0 the hub buffers the
-  full response before forwarding to the inbound client. Bidirectional
-  streaming pass-through is on the roadmap.
-- **Notifications** (JSON-RPC requests without `id`) fan out to every
-  enabled upstream with errors swallowed; the hub responds **202**.
-- **`mcpServers` ordering** is `priority` first (lower = earlier),
-  then config order. With `firstWins` / `lastWins` this controls which
-  server "wins" a name collision.
-- **Capabilities** advertised on `initialize` are exactly `tools`,
-  `resources`, `prompts`. Other capabilities (`logging`, `completions`,
-  `experimental`) are *not* advertised because the hub does not
-  implement their methods — advertising without implementing trips
-  strict clients (e.g. MCP Inspector errors out with "Server declares
-  X capability but doesn't implement method").
-
-## Endpoint matching
-
-`mcpEndpoint` is treated as a suffix match — if API Manager mounts the
-governed API at `/api/v1`, the policy still serves the hub at
-`/api/v1/mcp` without re-configuration. Set `strictMode: true` (default)
-to 404 anything that does not hit the MCP endpoint; set
-`strictMode: false` to fall through to the gateway's own upstream so
-the policy can stack with other APIs on the same instance.
+- **Source repository** — https://github.com/P4A-Policies-for-Agents/mcp-hub-policy
+- **Video tutorial** — https://youtu.be/3wY2t23moCc?si=HQPDpe2bYXY7NorY

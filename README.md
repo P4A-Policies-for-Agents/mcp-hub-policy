@@ -30,27 +30,47 @@ the discovery calls (`tools/list`, `resources/list`, `prompts/list`)
 and routing the invocation calls (`tools/call`, `resources/read`,
 `prompts/get`) to the right backend.
 
-## Goals
+## Features (0.3.x)
 
-- **One endpoint, many MCP servers.** Clients see a single
-  `/mcp` URL and a unified tool catalogue.
-- **Declarative configuration in API Manager.** Add or remove an
-  upstream MCP server by editing policy config — no code changes, no
-  redeploys.
-- **Per-server authentication.** Each upstream picks its own scheme
-  (`bearerToken`, `basicAuth`, `apiKeyHeader`, `customHeaders`, or
-  `none`); the hub keeps secrets out of clients.
-- **Spec-compliant MCP Streamable HTTP.** Works out of the box with
-  Claude Desktop, MCP Inspector, Postman, ChatGPT Desktop, and any
-  conformant Streamable-HTTP client — including correct handling of
-  `initialize`, `notifications/initialized` (202), `GET` for SSE
-  fallback, and tool-name regex `^[a-zA-Z0-9_-]{1,64}$`.
-- **Collision handling.** Two upstreams advertising the same tool name
-  are disambiguated automatically (default: prefix with the server
-  name).
-- **Operational safety.** Slow / failing upstreams are skipped during
-  aggregation; routed calls have per-request timeouts; errors are
-  returned as MCP-compliant JSON-RPC error envelopes.
+- **One endpoint, up to 50 MCP servers.** Clients see a single `/mcp`
+  URL and one combined tool catalogue.
+- **Declarative configuration in API Manager.** Add, remove or disable
+  an upstream MCP server by editing the policy configuration — no code
+  changes, no redeploys.
+- **Per-server authentication.** Each upstream uses its own scheme:
+  `none`, `bearerToken`, `basicAuth`, `apiKeyHeader`, `customHeaders`
+  or `passthrough`. Static secrets stay out of clients.
+- **Masked secrets.** `token`, `password`, `apiKey` and every
+  `headers[].value` are `security:sensitive`, so API Manager masks them.
+- **Per-user token passthrough.** `authType: passthrough` forwards the
+  caller's `Authorization` header (or `headerName`) to that upstream
+  only.
+- **Mixed-auth aggregation.** `tools/list` returns everything from the
+  upstreams that answered; upstreams that need a token the caller
+  didn't send, or rejected it, are skipped.
+- **OAuth-ready challenges.** A routed call to a passthrough upstream
+  without a valid token gets HTTP 401/403 with `WWW-Authenticate`;
+  optional RFC 9728 protected-resource metadata is served by the policy.
+- **Fast discovery.** `*/list` calls query all upstreams concurrently;
+  each upstream's answer is cached for `manifestCacheTtlSeconds` (per
+  caller for `passthrough` servers).
+- **Collision handling.** Duplicate names across upstreams are
+  disambiguated automatically (default: prefix with the server name).
+- **Spec-compliant MCP Streamable HTTP.** Protocol-version negotiation,
+  `notifications/initialized` (202), `GET` for SSE clients, stateless
+  client sessions, tool names matching `^[a-zA-Z0-9_-]{1,64}$`.
+- **Upstream session management.** Sessions are reused per server (per
+  user for passthrough), expire after a TTL and are re-established
+  automatically.
+- **Operational safety.** Slow, failing or unauthorized upstreams are
+  skipped during aggregation; routed calls have per-request timeouts.
+
+The full configuration reference — authentication, mixed-auth
+behaviour, collision strategies, settings, methods, limitations and
+security notes — is the Exchange page,
+[`definition/home.md`](definition/home.md).
+
+Requires Flex Gateway 1.6.1 or later.
 
 ## Business benefits
 
@@ -58,7 +78,7 @@ and routing the invocation calls (`tools/call`, `resources/read`,
 |---|---|
 | **Faster agent rollout** | Onboard a new MCP-enabled app in minutes by editing API Manager config, instead of pushing connection updates to every client. |
 | **One governed front door** | API Manager owns auth, throttling, logging, and policy chaining for the entire MCP fleet — your agents never get raw access to backend MCP servers. |
-| **Safe credential boundary** | Secrets stay in API Manager (`${secure::...}`), never in client config. Rotating an upstream's token is a policy-config edit. |
+| **Safe credential boundary** | Static secrets live only in the policy config, in masked (`security:sensitive`) fields — never in client config. Rotating an upstream's token is a policy-config edit. |
 | **Vendor-neutral agents** | Any MCP-conformant client works against the hub — no client-specific connectors required. |
 | **Pay-as-you-grow tool catalogue** | Add new tool surfaces (a new MCP server) without retraining or reconfiguring agents — the next `tools/list` call surfaces them automatically. |
 | **Centralized observability** | Every MCP call traverses Flex Gateway — leverage the platform's existing telemetry instead of stitching logs from N MCP servers. |
@@ -115,26 +135,32 @@ strictMode:            true
 collisionStrategy:     prefix
 aggregationTimeoutMs:  5000
 perRequestTimeoutMs:   30000
-manifestCacheTtlSeconds: 60
+manifestCacheTtlSeconds: 60     # 0 = always ask the upstreams
 mcpServers:
   - name:      erp
     endpoint:  https://erp-mcp.example.com/mcp
     enabled:   true
     authType:  bearerToken
-    token:     ${secure::erp.token}
+    token:     <erp-service-token>
 
   - name:      crm
     endpoint:  https://crm-mcp.example.com/mcp
     enabled:   true
     authType:  apiKeyHeader
     headerName: x-api-key
-    apiKey:    ${secure::crm.key}
+    apiKey:    <crm-api-key>
 
   - name:      kb
     endpoint:  https://kb-mcp.example.com/mcp
     enabled:   true
     authType:  none
 ```
+
+Secret fields — `token`, `password`, `apiKey` and every `headers[].value`
+— are marked `security:sensitive` in the policy schema: API Manager masks
+them while you type and does not show the stored value again. Enter the
+literal secret; the policy does not resolve `${secure::...}` or other
+property placeholders. Up to 50 servers can be configured.
 
 Or via CLI:
 
@@ -176,15 +202,15 @@ Examples:
 ```sh
 URL=https://<your-gateway>/mcp-hub/mcp
 
-# initialize → 200 + minted mcp-session-id
+# initialize → 200 (stateless: no mcp-session-id)
 curl -sSi "$URL" -H 'content-type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
        "params":{"protocolVersion":"2024-11-05","capabilities":{},
                  "clientInfo":{"name":"probe","version":"0.1"}}}'
 
 # tools/list → aggregated catalogue, names like erp_get_inventory, crm_search
+# Add -H "authorization: Bearer $TOKEN" to include passthrough upstreams.
 curl -sS "$URL" -H 'content-type: application/json' \
-  -H "mcp-session-id: <id-from-initialize>" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq .
 ```
 
@@ -199,11 +225,31 @@ curl -sS "$URL" -H 'content-type: application/json' \
 | `tools/list`      | Aggregate across all enabled upstreams        |
 | `tools/call`      | Route to the upstream owning the tool name    |
 | `resources/list`  | Aggregate                                     |
-| `resources/read`  | Route                                         |
+| `resources/read`  | Route by `uri` to the server that listed it   |
 | `prompts/list`    | Aggregate                                     |
 | `prompts/get`     | Route                                         |
-| `notifications/*` | Best-effort fan-out to every upstream → 202   |
+| `notifications/*` | 202; forwarded best-effort to passthrough upstreams where the caller has a session |
+| anything else     | `METHOD_NOT_FOUND`                            |
 | `GET /mcp`        | 200 + empty `text/event-stream` for SSE clients; otherwise 405 + `Allow: POST` |
+
+## Limits and known limitations
+
+- Up to 50 servers per policy.
+- With a cold cache, `*/list` latency is set by the slowest upstream;
+  cached answers can be up to `manifestCacheTtlSeconds` old. In a
+  50-server test on CloudHub (public MCP servers), a cold `tools/list`
+  took about 0.5–5 s and a cached one about 0.1–0.3 s. Each gateway
+  replica has its own cache.
+- Cached `passthrough` lists are not re-checked against the caller's
+  token, so a revoked token can still see the list until it expires.
+  Routed calls always go to the upstream with the caller's token.
+- `resources/read` works for URIs listed by `resources/list`; resource
+  templates are not aggregated. Resources on `passthrough` servers are
+  found only when the caller sends a token; without one the read returns
+  `RESOURCE_NOT_FOUND` (`-32012`), not HTTP 401.
+- Only the first page of each upstream's list is returned.
+- Responses are buffered, not streamed; notifications an SSE upstream
+  sends before its result are dropped.
 
 ## Collision handling
 
@@ -223,19 +269,21 @@ Other modes: `reject` (fail aggregation on duplicate), `firstWins`,
 mcp-hub-policy/
 ├── definition/
 │   ├── gcl.yaml          # Policy schema published to Anypoint Exchange
-│   └── home.md           # Exchange landing page
+│   └── home.md           # Exchange home page (configuration reference)
 ├── playground/           # Local Flex Gateway for `make run`
 ├── src/
 │   ├── lib.rs            # entrypoint, request_filter, dispatch
 │   ├── config.rs         # typed PolicyConfig + validation
 │   ├── jsonrpc.rs        # JSON-RPC 2.0 envelope + MCP error codes
 │   ├── upstream.rs       # outbound JSON-RPC client per MCP server
+│   ├── session.rs        # upstream MCP session cache
+│   ├── manifest.rs       # upstream */list answer cache
 │   ├── mcp/
 │   │   ├── method.rs     # method classifier
 │   │   ├── types.rs      # serverInfo, capabilities
 │   │   └── aggregate.rs  # collision-aware manifest merge
 │   └── generated/        # codegen mirror (auto-regen by `make build`)
-└── tests/                # 34 unit + integration tests
+└── tests/                # integration tests (with the unit tests in src/: 77)
 ```
 
 ## Build / test / publish
@@ -243,11 +291,14 @@ mcp-hub-policy/
 ```sh
 make setup     # one-time
 make build     # builds wasm + definition + implementation YAMLs
-make test      # cargo unit + integration tests (34 passing)
+make test      # cargo unit + integration tests
 make run       # local Flex Gateway with the policy applied
 make publish   # development version → Anypoint Exchange
 make release   # release version → Anypoint Exchange
 ```
+
+`make upload-docs` uploads `definition/home.md` as the Exchange home page
+of the released version.
 
 `make build` regenerates `src/generated/config.rs` from
 `definition/gcl.yaml`. Don't edit the generated file by hand — change

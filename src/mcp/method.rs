@@ -6,12 +6,14 @@
 //!   * `tools/list`            — aggregate from all enabled servers.
 //!   * `tools/call`            — route to the owning server.
 //!   * `resources/list`        — aggregate.
-//!   * `resources/read`        — route.
+//!   * `resources/read`        — route by `uri`.
 //!   * `prompts/list`          — aggregate.
 //!   * `prompts/get`           — route.
 //!   * `ping`                  — local 200.
-//!   * `notifications/...`     — best-effort fan-out (client-initiated).
+//!   * `notifications/...`     — 202; forwarded best-effort to passthrough
+//!     upstreams where the caller has a session.
 
+/// An inbound JSON-RPC method, classified for dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpMethod {
     Initialize,
@@ -22,16 +24,16 @@ pub enum McpMethod {
     ResourcesRead,
     PromptsList,
     PromptsGet,
-    /// Notification (no `id`). Client → hub. Forwarded to all enabled
-    /// upstream servers best-effort.
+    /// Notification (no `id`). Client → hub. Answered 202; forwarded
+    /// best-effort to passthrough upstreams where the caller has a session.
     Notification(String),
-    /// A method we don't recognize. Either rejected with
-    /// `METHOD_NOT_FOUND` (strict mode) or routed to the first enabled
-    /// upstream server.
+    /// A method we don't recognize. Always answered with
+    /// `METHOD_NOT_FOUND`.
     Other(String),
 }
 
 impl McpMethod {
+    /// Classify `method`; anything without an `id` is a notification.
     pub fn parse(method: &str, is_notification: bool) -> Self {
         if is_notification {
             return Self::Notification(method.to_string());

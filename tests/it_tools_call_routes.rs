@@ -111,7 +111,10 @@ fn tools_call_dispatches_to_owning_upstream_with_unprefixed_name() {
     assert_eq!(jira_seen["params"]["arguments"]["q"], "fix bug");
 
     // Slack was not contacted at all.
-    assert!(last_slack_body.borrow().is_none(), "slack should not be hit");
+    assert!(
+        last_slack_body.borrow().is_none(),
+        "slack should not be hit"
+    );
 }
 
 #[test]

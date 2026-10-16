@@ -188,6 +188,7 @@ and translate to/from each upstream's Streamable HTTP transport.
 - Streaming responses are buffered (P1 #1).
 - The runtime upstream table is fixed at policy load — adding /
   removing an upstream requires a re-publish (P3 #11).
-- The per-server `headers` array values are stored verbatim in policy
-  config. Use `${secure::...}` references for any value that should
-  not appear in API Manager exports.
+- Secret fields (`token`, `password`, `apiKey`, `headers[].value`) are
+  `security:sensitive` (masked in API Manager), but hold the literal
+  value — the policy does not resolve `${secure::...}` placeholders.
+  Integration with a secrets manager is not implemented.
