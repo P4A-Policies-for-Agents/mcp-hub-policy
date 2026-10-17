@@ -5,17 +5,17 @@
 //! per-server auth materials (Bearer / Basic / API key / custom
 //! headers).
 //!
-//! Streaming (SSE / chunked) is not currently materialized — the hub
-//! collects the full response body before forwarding to the inbound
-//! client. Streaming pass-through is tracked as future work in the
-//! requirements doc (§6.12).
+//! Streaming (SSE / chunked) is not passed through: the hub collects the
+//! full response body and returns the JSON-RPC response it contains.
+//! Notifications an upstream sends on the stream before the response
+//! are dropped.
 
 use std::rc::Rc;
 use std::time::Duration;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use pdk::hl::{HttpClient, Service};
+use pdk::hl::{HttpClient, HttpClientResponse, Service};
 use pdk::logger;
 use thiserror::Error;
 
@@ -28,7 +28,22 @@ pub enum UpstreamError {
     Transport { server: String, message: String },
 
     #[error("MCP upstream '{server}' returned HTTP {status}")]
-    HttpStatus { server: String, status: u32 },
+    HttpStatus {
+        server: String,
+        status: u32,
+        /// Upstream `WWW-Authenticate` header, kept for 401/403 propagation.
+        www_authenticate: Option<String>,
+    },
+
+    #[error("MCP upstream '{server}' requires the caller's credential, none was sent")]
+    MissingCredential { server: String },
+
+    #[error("MCP upstream '{server}' rejected initialize: {message} ({code})")]
+    InitializeRejected {
+        server: String,
+        code: i32,
+        message: String,
+    },
 
     #[error("MCP upstream returned non-JSON-RPC body: {0}")]
     BadJson(String),
@@ -40,7 +55,9 @@ pub struct OutboundHeaders(Vec<(String, String)>);
 impl OutboundHeaders {
     /// Build the header set for an outbound call: auth materials +
     /// per-server `headers` overrides + a constant content-type/accept.
-    pub fn build(server: &McpServerConfig) -> Self {
+    /// `credential` is the caller's inbound header value, used only for
+    /// `AuthConfig::Passthrough` servers.
+    pub fn build(server: &McpServerConfig, credential: Option<&str>) -> Self {
         let mut headers: Vec<(String, String)> = vec![
             ("content-type".into(), "application/json".into()),
             // MCP Streamable HTTP advertises both via `Accept` so the
@@ -60,11 +77,19 @@ impl OutboundHeaders {
                 let encoded = B64.encode(raw.as_bytes());
                 headers.push(("authorization".into(), format!("Basic {encoded}")));
             }
-            AuthConfig::ApiKey { header_name, api_key } => {
+            AuthConfig::ApiKey {
+                header_name,
+                api_key,
+            } => {
                 headers.push((header_name.clone(), api_key.clone()));
             }
             AuthConfig::CustomHeaders => {
                 // Auth materials are sourced from `extra_headers` below.
+            }
+            AuthConfig::Passthrough { .. } => {
+                if let (Some(name), Some(value)) = (server.passthrough_header(), credential) {
+                    headers.push((name.to_string(), value.to_string()));
+                }
             }
         }
         for (k, v) in &server.extra_headers {
@@ -74,10 +99,14 @@ impl OutboundHeaders {
     }
 
     pub fn as_refs(&self) -> Vec<(&str, &str)> {
-        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+        self.0
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
     }
 }
 
+/// One configured upstream MCP server and its Flex Gateway service.
 pub struct UpstreamClient {
     pub server: McpServerConfig,
     pub service: Rc<Service>,
@@ -96,57 +125,23 @@ impl UpstreamClient {
     /// `mcp_session_id` (when `Some`) is sent as the `mcp-session-id`
     /// header — required by Streamable HTTP MCP servers that gate
     /// post-`initialize` traffic on a per-session id.
+    ///
+    /// `credential` is the caller's inbound header value for
+    /// `authType=passthrough` servers (see [`OutboundHeaders::build`]).
     pub async fn call(
         &self,
         http: &HttpClient,
         request: JsonRpcOutbound,
         timeout: Duration,
         mcp_session_id: Option<&str>,
+        credential: Option<&str>,
     ) -> Result<UpstreamCallResult, UpstreamError> {
-        let body = request.into_bytes();
-        let mut headers = OutboundHeaders::build(&self.server);
-        if let Some(sid) = mcp_session_id {
-            headers.0.push(("mcp-session-id".into(), sid.to_string()));
-        }
-        let header_refs = headers.as_refs();
+        let response = self
+            .send(http, request, timeout, mcp_session_id, credential)
+            .await?;
 
-        let response = http
-            .request(self.service.as_ref())
-            .path(&self.server.path)
-            .headers(header_refs)
-            .timeout(timeout)
-            .body(body.as_slice())
-            .post()
-            .await
-            .map_err(|e| UpstreamError::Transport {
-                server: self.server.name.clone(),
-                message: e.to_string(),
-            })?;
-
-        let status = response.status_code();
-        if !(200..300).contains(&status) {
-            logger::warn!(
-                "mcp-hub: upstream '{}' returned HTTP {}",
-                self.server.name,
-                status
-            );
-            return Err(UpstreamError::HttpStatus {
-                server: self.server.name.clone(),
-                status,
-            });
-        }
-
-        let returned_session_id = response
-            .headers()
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
-            .map(|(_, v)| v.to_string());
-        let content_type = response
-            .headers()
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .map(|(_, v)| v.to_string())
-            .unwrap_or_default();
+        let returned_session_id = header_value(&response, "mcp-session-id");
+        let content_type = header_value(&response, "content-type").unwrap_or_default();
 
         let body_bytes = response.body();
         let json_bytes = if content_type.contains("text/event-stream") {
@@ -167,6 +162,72 @@ impl UpstreamClient {
             mcp_session_id: returned_session_id,
         })
     }
+
+    /// Send a JSON-RPC notification. Upstreams answer 202 with no body,
+    /// so only the HTTP status is checked.
+    pub async fn notify(
+        &self,
+        http: &HttpClient,
+        notification: JsonRpcOutbound,
+        timeout: Duration,
+        mcp_session_id: Option<&str>,
+        credential: Option<&str>,
+    ) -> Result<(), UpstreamError> {
+        self.send(http, notification, timeout, mcp_session_id, credential)
+            .await
+            .map(|_| ())
+    }
+
+    async fn send(
+        &self,
+        http: &HttpClient,
+        request: JsonRpcOutbound,
+        timeout: Duration,
+        mcp_session_id: Option<&str>,
+        credential: Option<&str>,
+    ) -> Result<HttpClientResponse, UpstreamError> {
+        let body = request.into_bytes();
+        let mut headers = OutboundHeaders::build(&self.server, credential);
+        if let Some(sid) = mcp_session_id {
+            headers.0.push(("mcp-session-id".into(), sid.to_string()));
+        }
+
+        let response = http
+            .request(self.service.as_ref())
+            .path(&self.server.path)
+            .headers(headers.as_refs())
+            .timeout(timeout)
+            .body(body.as_slice())
+            .post()
+            .await
+            .map_err(|e| UpstreamError::Transport {
+                server: self.server.name.clone(),
+                message: e.to_string(),
+            })?;
+
+        let status = response.status_code();
+        if !(200..300).contains(&status) {
+            logger::warn!(
+                "mcp-hub: upstream '{}' returned HTTP {}",
+                self.server.name,
+                status
+            );
+            return Err(UpstreamError::HttpStatus {
+                server: self.server.name.clone(),
+                status,
+                www_authenticate: header_value(&response, "www-authenticate"),
+            });
+        }
+        Ok(response)
+    }
+}
+
+fn header_value(response: &HttpClientResponse, name: &str) -> Option<String> {
+    response
+        .headers()
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.to_string())
 }
 
 /// Outcome of one upstream call. The session id is `Some` when the
@@ -178,24 +239,23 @@ pub struct UpstreamCallResult {
     pub mcp_session_id: Option<String>,
 }
 
-/// Extract the first JSON-RPC payload from an SSE-formatted response
-/// body. Looks for `data: { ... }` lines, concatenating multi-line
-/// `data:` continuations per the SSE spec. Returns the raw JSON bytes
-/// or `None` if no usable `data:` line is found.
+/// Extract the JSON-RPC response from an SSE-formatted response body.
+/// Upstreams may send notifications (progress, logs) or requests on the
+/// stream before the response, so events are scanned in order and the
+/// first one carrying `result` or `error` is returned. Multi-line `data:`
+/// continuations are joined per the SSE spec. Returns the raw JSON bytes
+/// or `None` if no event holds a JSON-RPC response.
 fn extract_jsonrpc_from_sse(body: &[u8]) -> Option<Vec<u8>> {
     let s = std::str::from_utf8(body).ok()?;
     let mut current = String::new();
     for raw_line in s.split('\n') {
         let line = raw_line.trim_end_matches('\r');
         if line.is_empty() {
-            // Event boundary. If we have an accumulated `data:`, return it.
-            if !current.is_empty() {
-                let trimmed = current.trim();
-                if trimmed.starts_with('{') {
-                    return Some(trimmed.as_bytes().to_vec());
-                }
-                current.clear();
+            // Event boundary: return the event if it is the response.
+            if let Some(json) = response_event(&current) {
+                return Some(json);
             }
+            current.clear();
             continue;
         }
         if let Some(rest) = line.strip_prefix("data:") {
@@ -207,12 +267,20 @@ fn extract_jsonrpc_from_sse(body: &[u8]) -> Option<Vec<u8>> {
         }
         // ignore other SSE fields (event:, id:, retry:, comments)
     }
-    let trimmed = current.trim();
-    if trimmed.starts_with('{') {
-        Some(trimmed.as_bytes().to_vec())
-    } else {
-        None
+    response_event(&current)
+}
+
+/// The event's data as bytes when it is a JSON-RPC response (an object
+/// with `result` or `error`); `None` for notifications, requests and
+/// non-JSON data.
+fn response_event(data: &str) -> Option<Vec<u8>> {
+    let trimmed = data.trim();
+    if !trimmed.starts_with('{') {
+        return None;
     }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    (value.get("result").is_some() || value.get("error").is_some())
+        .then(|| trimmed.as_bytes().to_vec())
 }
 
 #[cfg(test)]
@@ -233,8 +301,10 @@ mod tests {
 
     #[test]
     fn bearer_emits_authorization_bearer() {
-        let s = server_with_auth(AuthConfig::Bearer { token: "abc".into() });
-        let h = OutboundHeaders::build(&s);
+        let s = server_with_auth(AuthConfig::Bearer {
+            token: "abc".into(),
+        });
+        let h = OutboundHeaders::build(&s, None);
         let auth = h.0.iter().find(|(k, _)| k == "authorization").unwrap();
         assert_eq!(auth.1, "Bearer abc");
     }
@@ -245,7 +315,7 @@ mod tests {
             username: "u".into(),
             password: "p".into(),
         });
-        let h = OutboundHeaders::build(&s);
+        let h = OutboundHeaders::build(&s, None);
         let auth = h.0.iter().find(|(k, _)| k == "authorization").unwrap();
         // base64("u:p") == "dTpw"
         assert_eq!(auth.1, "Basic dTpw");
@@ -257,7 +327,7 @@ mod tests {
             header_name: "x-api-key".into(),
             api_key: "k".into(),
         });
-        let h = OutboundHeaders::build(&s);
+        let h = OutboundHeaders::build(&s, None);
         let api = h.0.iter().find(|(k, _)| k == "x-api-key").unwrap();
         assert_eq!(api.1, "k");
     }
@@ -265,10 +335,58 @@ mod tests {
     #[test]
     fn extra_headers_are_appended() {
         let mut s = server_with_auth(AuthConfig::None);
-        s.extra_headers
-            .push(("x-env".into(), "prod".into()));
-        let h = OutboundHeaders::build(&s);
+        s.extra_headers.push(("x-env".into(), "prod".into()));
+        let h = OutboundHeaders::build(&s, None);
         assert!(h.0.iter().any(|(k, v)| k == "x-env" && v == "prod"));
+    }
+
+    #[test]
+    fn passthrough_forwards_caller_credential() {
+        let s = server_with_auth(AuthConfig::Passthrough {
+            header_name: "authorization".into(),
+        });
+        let h = OutboundHeaders::build(&s, Some("Bearer user-jwt"));
+        let auth = h.0.iter().find(|(k, _)| k == "authorization").unwrap();
+        assert_eq!(auth.1, "Bearer user-jwt");
+    }
+
+    #[test]
+    fn passthrough_sends_nothing_without_credential() {
+        let s = server_with_auth(AuthConfig::Passthrough {
+            header_name: "authorization".into(),
+        });
+        let h = OutboundHeaders::build(&s, None);
+        assert!(!h.0.iter().any(|(k, _)| k == "authorization"));
+    }
+
+    #[test]
+    fn configured_header_overrides_passthrough_credential() {
+        let mut s = server_with_auth(AuthConfig::Passthrough {
+            header_name: "authorization".into(),
+        });
+        s.extra_headers
+            .push(("Authorization".into(), "Bearer configured".into()));
+        let h = OutboundHeaders::build(&s, Some("Bearer user-jwt"));
+        let values: Vec<_> =
+            h.0.iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.as_str())
+                .collect();
+        assert_eq!(values, vec!["Bearer configured"]);
+    }
+
+    #[test]
+    fn static_auth_ignores_caller_credential() {
+        let s = server_with_auth(AuthConfig::Bearer {
+            token: "abc".into(),
+        });
+        let h = OutboundHeaders::build(&s, Some("Bearer user-jwt"));
+        let values: Vec<_> =
+            h.0.iter()
+                .filter(|(k, _)| k == "authorization")
+                .map(|(_, v)| v.as_str())
+                .collect();
+        assert_eq!(values, vec!["Bearer abc"]);
     }
 
     #[test]
@@ -286,6 +404,30 @@ mod tests {
         let json = extract_jsonrpc_from_sse(body).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["id"], 2);
+    }
+
+    #[test]
+    fn sse_skips_notifications_before_the_response() {
+        let body = b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":1}}\n\n\
+event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
+        let json = extract_jsonrpc_from_sse(body).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["id"], 3);
+        assert_eq!(v["result"]["ok"], true);
+    }
+
+    #[test]
+    fn sse_returns_error_responses() {
+        let body = b"data: {\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32601,\"message\":\"nope\"}}";
+        let json = extract_jsonrpc_from_sse(body).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["error"]["code"], -32601);
+    }
+
+    #[test]
+    fn sse_returns_none_when_only_notifications() {
+        let body = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n";
+        assert!(extract_jsonrpc_from_sse(body).is_none());
     }
 
     #[test]

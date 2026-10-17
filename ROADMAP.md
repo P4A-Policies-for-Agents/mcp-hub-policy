@@ -62,13 +62,18 @@ PDK 1.8 supports streaming response bodies via `ResponseBodyState`.
 Implementing this requires switching the response phase from
 `send_response` (one-shot) to a streaming variant.
 
-### 2. Manifest cache (TTL already wired)
+### 2. Manifest cache — shipped in 0.3.2
 
-`manifestCacheTtlSeconds` is already a config knob (default 60s) but
-the response path re-aggregates on every routed call when the strategy
-is not `prefix`. Implement an in-memory cache keyed by
-`(method, collisionStrategy, generation)` so the slow-path resolver
-only re-aggregates after the TTL elapses.
+`manifestCacheTtlSeconds` (default 60) caches each upstream's
+`tools/list`, `resources/list` and `prompts/list` answer in the PDK
+shared cache (per caller for `passthrough`). Failed answers and
+answers over 64 KB are not cached; `0` disables the cache. See
+`src/manifest.rs` and `CHANGELOG.md` [0.3.2].
+
+Remaining work (optional): a second-level aggregated-manifest cache
+keyed by `(method, collisionStrategy, generation)` so non-`prefix`
+owner lookup does not re-aggregate when every upstream answer is
+already warm.
 
 ### 3. Per-route trust modes (parity with `acp-to-a2a`)
 
@@ -188,6 +193,7 @@ and translate to/from each upstream's Streamable HTTP transport.
 - Streaming responses are buffered (P1 #1).
 - The runtime upstream table is fixed at policy load — adding /
   removing an upstream requires a re-publish (P3 #11).
-- The per-server `headers` array values are stored verbatim in policy
-  config. Use `${secure::...}` references for any value that should
-  not appear in API Manager exports.
+- Secret fields (`token`, `password`, `apiKey`, `headers[].value`) are
+  `security:sensitive` (masked in API Manager), but hold the literal
+  value — the policy does not resolve `${secure::...}` placeholders.
+  Integration with a secrets manager is not implemented.

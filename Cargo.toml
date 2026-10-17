@@ -1,7 +1,7 @@
 # Copyright 2026 Salesforce, Inc. All rights reserved.
 [package]
 name = "mcp_hub"
-version = "0.2.5"
+version = "0.3.2"
 rust-version = "1.88.0"
 edition = "2021"
 
@@ -21,6 +21,7 @@ anyhow = "1.0"
 thiserror = "1"
 base64 = "0.22"
 sha2 = "0.10"
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 pdk-unit = "1.8.0"

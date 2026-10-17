@@ -60,8 +60,9 @@ spec:
       default: 5000
       description: |
         Per-upstream timeout (ms) when aggregating manifests
-        (`tools/list`, `resources/list`, `prompts/list`). Slow upstreams
-        are skipped with a warning rather than failing the aggregate.
+        (`tools/list`, `resources/list`, `prompts/list`). Upstreams are
+        queried concurrently; slow upstreams are skipped with a warning
+        rather than failing the aggregate.
     perRequestTimeoutMs:
       type: integer
       minimum: 100
@@ -76,17 +77,65 @@ spec:
       maximum: 86400
       default: 60
       description: |
-        TTL (seconds) for the in-memory aggregated manifest cache. After
-        this many seconds the next `tools/list`, `resources/list`, or
-        `prompts/list` re-aggregates from the upstream servers.
+        How long (seconds) each upstream's `tools/list`, `resources/list`
+        and `prompts/list` answer is reused, per caller for passthrough
+        servers. Failed answers are not cached. 0 disables the cache.
     diagnosticContinueFlow:
       type: boolean
       default: false
       description: |
-        Diagnostic only. When true the policy still performs aggregation /
-        routing, but returns Flow::Continue at the end of the request
-        handler instead of Flow::Break. Used to test runtime traps.
-        Leave false in production.
+        Deprecated and ignored. Kept so existing configurations remain
+        valid.
+    upstreamSessionTtlSeconds:
+      type: integer
+      minimum: 0
+      maximum: 86400
+      default: 1800
+      description: |
+        How long (seconds) the hub reuses an upstream MCP session id before
+        re-initializing. Sessions for `authType=passthrough` servers are
+        kept per caller credential, so users never share an upstream
+        session. 0 disables reuse (initialize on every request). An
+        upstream 404 on a cached session triggers an immediate
+        re-initialize regardless of TTL.
+    allowedOrigins:
+      type: array
+      description: |
+        Allowed values of the inbound `Origin` header (e.g.
+        `https://app.example.com`). When non-empty, requests carrying an
+        `Origin` not in this list are rejected with 403, as required by the
+        MCP Streamable HTTP transport. Leave empty to delegate Origin
+        checks to a gateway CORS policy.
+      items:
+        type: string
+
+    # ------------------------------------------------------------------
+    # OAuth protected-resource metadata (RFC 9728)
+    # ------------------------------------------------------------------
+    resourceUrl:
+      type: string
+      description: |
+        Canonical URL of this hub's MCP endpoint as clients see it (e.g.
+        `https://gw.example.com/mcp-hub/mcp`). Required when
+        `authorizationServers` is set. The hub serves its metadata at
+        `<resourceUrl>/.well-known/oauth-protected-resource` and points
+        `WWW-Authenticate` there on 401 responses.
+    authorizationServers:
+      type: array
+      description: |
+        Issuer URL(s) of the authorization server that mints the tokens
+        callers forward to `authType=passthrough` servers. When set, the
+        hub serves protected-resource metadata so MCP clients can discover
+        where to log in.
+      items:
+        type: string
+    scopesSupported:
+      type: array
+      description: |
+        Optional `scopes_supported` advertised in the protected-resource
+        metadata.
+      items:
+        type: string
 
     # ------------------------------------------------------------------
     # Upstream MCP server registry
@@ -95,7 +144,7 @@ spec:
       type: array
       description: |
         Array of MCP server definitions. Each entry is an MCP Streamable
-        HTTP endpoint that the hub aggregates. Maximum 20 entries.
+        HTTP endpoint that the hub aggregates. Maximum 50 entries.
       items:
         type: object
         properties:
@@ -104,7 +153,7 @@ spec:
             description: |
               Logical server identifier. Used as the prefix when
               `collisionStrategy=prefix` and as the routing key for
-              `<server>.<tool>` invocations. Must be unique.
+              `<server>_<tool>` invocations. Must be unique.
           endpoint:
             type: string
             format: service
@@ -126,6 +175,7 @@ spec:
               - basicAuth
               - apiKeyHeader
               - customHeaders
+              - passthrough
             default: none
             description: |
               Authentication strategy applied to outbound calls to this
@@ -135,9 +185,17 @@ spec:
               - basicAuth: `Authorization: Basic base64(username:password)`.
               - apiKeyHeader: `<headerName>: <apiKey>`.
               - customHeaders: arbitrary headers from the `headers` array.
+              - passthrough: forward the caller's own inbound header
+                (`headerName`, default `Authorization`) to this server only.
+                Use when the caller's token is valid for the upstream as-is
+                (e.g. a gateway in the same trust domain). Note: this is the
+                MCP "token passthrough" pattern; it relies on the upstream
+                accepting the hub's audience.
           token:
             type: string
-            format: password
+            "@context":
+              "@characteristics":
+                - "security:sensitive"
             description: |
               Static bearer token. Required when `authType=bearerToken`.
           username:
@@ -146,17 +204,22 @@ spec:
               Basic auth username. Required when `authType=basicAuth`.
           password:
             type: string
-            format: password
+            "@context":
+              "@characteristics":
+                - "security:sensitive"
             description: |
               Basic auth password. Required when `authType=basicAuth`.
           headerName:
             type: string
             description: |
               API-key header name (e.g. `x-api-key`). Required when
-              `authType=apiKeyHeader`.
+              `authType=apiKeyHeader`. With `authType=passthrough`, the
+              inbound header to forward (default `authorization`).
           apiKey:
             type: string
-            format: password
+            "@context":
+              "@characteristics":
+                - "security:sensitive"
             description: |
               API-key value. Required when `authType=apiKeyHeader`.
           headers:
@@ -173,7 +236,9 @@ spec:
                   description: HTTP header name.
                 value:
                   type: string
-                  format: password
+                  "@context":
+                    "@characteristics":
+                      - "security:sensitive"
                   description: HTTP header value.
               required:
                 - name

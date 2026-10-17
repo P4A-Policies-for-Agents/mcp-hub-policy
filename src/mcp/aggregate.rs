@@ -6,8 +6,8 @@
 //!   2. Extracts each entry's `name`.
 //!   3. Applies [`crate::config::CollisionStrategy`] across servers.
 //!   4. Stamps an `_origin` hint on each entry so the routing layer knows
-//!      which server owns each name. The hint also lets clients see the
-//!      original (un-prefixed) name when the strategy is `prefix`.
+//!      which server owns each name (and its original, un-prefixed
+//!      name). The markers are stripped before the list goes to clients.
 //!
 //! Output of [`aggregate`] is the JSON array ready to be wrapped in the
 //! corresponding response key (`{"tools": [...]}` etc.).
@@ -96,26 +96,26 @@ pub fn aggregate(
     Ok(out)
 }
 
-/// Look up which server owns a given name. The aggregated array is the
-/// authoritative source; the lookup is linear because the cardinality is
-/// small (<= 100 tools per spec).
-pub fn resolve_owner(items: &[Value], requested_name: &str) -> Option<OwnerHint> {
-    for item in items {
-        let entry_name = item.get("name").and_then(|v| v.as_str())?;
-        if entry_name == requested_name {
-            let origin = item.get("_origin").and_then(|v| v.as_str())?.to_string();
-            let original = item
-                .get("_originalName")
-                .and_then(|v| v.as_str())
-                .unwrap_or(requested_name)
-                .to_string();
-            return Some(OwnerHint {
-                server: origin,
-                original_name: original,
-            });
-        }
+/// Look up which server owns the entry whose `key_field` (`name` for
+/// tools and prompts, `uri` for resources) equals `requested`. The
+/// aggregated array is the authoritative source; the lookup is linear in
+/// the number of entries. Resource URIs are never prefixed, so the
+/// original key of a `uri` lookup is the URI itself.
+pub fn resolve_owner(items: &[Value], key_field: &str, requested: &str) -> Option<OwnerHint> {
+    let item = items
+        .iter()
+        .find(|item| item.get(key_field).and_then(|v| v.as_str()) == Some(requested))?;
+    let origin = item.get("_origin").and_then(|v| v.as_str())?.to_string();
+    let original = match key_field {
+        "name" => item.get("_originalName").and_then(|v| v.as_str()),
+        _ => None,
     }
-    None
+    .unwrap_or(requested)
+    .to_string();
+    Some(OwnerHint {
+        server: origin,
+        original_name: original,
+    })
 }
 
 /// Strip the internal `_origin` / `_originalName` markers before
@@ -142,6 +142,7 @@ pub struct OwnerHint {
     pub original_name: String,
 }
 
+/// Aggregation failure (`collisionStrategy: reject` found a duplicate).
 #[derive(Debug, thiserror::Error)]
 pub enum AggregateError {
     #[error("duplicate name '{0}' across MCP servers (collisionStrategy=reject)")]
@@ -172,7 +173,8 @@ mod tests {
         // Sanity-check the MCP-client regex.
         for n in &names {
             assert!(
-                n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                n.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
                 "name '{n}' violates ^[a-zA-Z0-9_-]+$"
             );
         }
@@ -205,9 +207,28 @@ mod tests {
     fn resolve_owner_strips_prefix() {
         let items = vec![item("jira", "search"), item("slack", "list")];
         let out = aggregate(items, CollisionStrategy::Prefix).unwrap();
-        let hint = resolve_owner(&out, "jira_search").unwrap();
+        let hint = resolve_owner(&out, "name", "jira_search").unwrap();
         assert_eq!(hint.server, "jira");
         assert_eq!(hint.original_name, "search");
+    }
+
+    #[test]
+    fn resolve_owner_by_uri_keeps_uri() {
+        let items = vec![
+            UpstreamItem {
+                server: "docs",
+                value: json!({"name": "readme", "uri": "file:///readme.md"}),
+            },
+            UpstreamItem {
+                server: "wiki",
+                value: json!({"name": "home", "uri": "wiki://home"}),
+            },
+        ];
+        let out = aggregate(items, CollisionStrategy::Prefix).unwrap();
+        let hint = resolve_owner(&out, "uri", "wiki://home").unwrap();
+        assert_eq!(hint.server, "wiki");
+        assert_eq!(hint.original_name, "wiki://home");
+        assert!(resolve_owner(&out, "uri", "wiki://missing").is_none());
     }
 
     #[test]

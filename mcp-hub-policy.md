@@ -397,7 +397,7 @@ mcpServers:
   - name: jira
     endpoint: https://jira.company.com/mcp
     authType: bearerToken
-    token: ${secure::jira.token}
+    token: <jira-service-token>   # sensitive field, masked in API Manager
     headers:
       - name: x-env
         value: prod
@@ -406,7 +406,7 @@ mcpServers:
     endpoint: https://slack.company.com/mcp
     authType: apiKeyHeader
     headerName: x-api-key
-    apiKey: ${secure::slack.key}
+    apiKey: <slack-api-key>       # sensitive field, masked in API Manager
 ```
 
 ---

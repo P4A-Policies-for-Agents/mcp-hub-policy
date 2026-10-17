@@ -37,6 +37,10 @@ pub struct McpServers0Config {
 pub struct Config {
     #[serde(alias = "aggregationTimeoutMs")]
     pub aggregation_timeout_ms: Option<i64>,
+    #[serde(alias = "allowedOrigins")]
+    pub allowed_origins: Option<Vec<String>>,
+    #[serde(alias = "authorizationServers")]
+    pub authorization_servers: Option<Vec<String>>,
     #[serde(alias = "collisionStrategy")]
     pub collision_strategy: Option<String>,
     #[serde(alias = "diagnosticContinueFlow")]
@@ -49,8 +53,14 @@ pub struct Config {
     pub mcp_servers: Vec<McpServers0Config>,
     #[serde(alias = "perRequestTimeoutMs")]
     pub per_request_timeout_ms: Option<i64>,
+    #[serde(alias = "resourceUrl")]
+    pub resource_url: Option<String>,
+    #[serde(alias = "scopesSupported")]
+    pub scopes_supported: Option<Vec<String>>,
     #[serde(alias = "strictMode")]
     pub strict_mode: Option<bool>,
+    #[serde(alias = "upstreamSessionTtlSeconds")]
+    pub upstream_session_ttl_seconds: Option<i64>,
 }
 #[pdk::hl::entrypoint_flex]
 fn init(abi: &dyn pdk::flex_abi::api::FlexAbi) -> Result<(), anyhow::Error> {

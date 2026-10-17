@@ -1,7 +1,7 @@
 //! Minimal MCP domain types used during aggregation and routing.
 //!
 //! The hub treats tool/resource/prompt manifests as opaque JSON values
-//! (forwarded byte-for-byte to clients) but needs the `name` and a few
+//! (passed through apart from name prefixing) but needs the `name` and a few
 //! optional fields out of each entry so it can:
 //!
 //!   * detect collisions across upstream servers,

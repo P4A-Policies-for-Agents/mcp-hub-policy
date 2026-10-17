@@ -1,6 +1,8 @@
 // Copyright 2026 Salesforce, Inc. All rights reserved.
 
-//! Helpers shared across mcp-hub integration tests.
+//! Helpers shared across mcp-hub integration tests. Each test binary uses
+//! a different subset, so unused-helper warnings are silenced.
+#![allow(dead_code)]
 
 use pdk_unit::{Backend, UnitHttpMessage, UnitHttpRequest, UnitHttpResponse};
 

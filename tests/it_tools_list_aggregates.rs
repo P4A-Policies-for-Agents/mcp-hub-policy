@@ -111,7 +111,8 @@ fn tools_list_aggregates_with_prefix_strategy() {
     // All names must satisfy the MCP-client tool-name regex.
     for n in &names {
         assert!(
-            n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+            n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
             "name '{n}' violates ^[a-zA-Z0-9_-]+$"
         );
     }
@@ -126,11 +127,15 @@ fn tools_list_aggregates_with_prefix_strategy() {
     // Per-server auth was applied.
     let calls = log.borrow();
     assert!(
-        calls.iter().any(|c| c.contains("jira") && c.contains("Bearer jira-secret")),
+        calls
+            .iter()
+            .any(|c| c.contains("jira") && c.contains("Bearer jira-secret")),
         "no jira bearer in {calls:?}"
     );
     assert!(
-        calls.iter().any(|c| c.contains("slack") && c.contains("slack-key")),
+        calls
+            .iter()
+            .any(|c| c.contains("slack") && c.contains("slack-key")),
         "no slack api-key in {calls:?}"
     );
 }
