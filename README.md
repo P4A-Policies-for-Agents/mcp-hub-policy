@@ -216,6 +216,24 @@ curl -sS "$URL" -H 'content-type: application/json' \
 
 ---
 
+## Upgrading from 0.2.x
+
+Existing **policy configurations** (static-auth servers, `mcpEndpoint`,
+`strictMode`, collision strategy, timeouts, `diagnosticContinueFlow`)
+usually load unchanged. **MCP clients** may see behaviour differences:
+
+| Change | What to do |
+|---|---|
+| Hub is stateless toward clients — `initialize` no longer issues `mcp-session-id` | Drop any client logic that requires a hub session id. Upstream sessions are still managed by the policy. |
+| `protocolVersion` is negotiated; an unsupported `MCP-Protocol-Version` header is HTTP 400 | Send a supported version (`2025-06-18`, `2025-03-26`, or `2024-11-05`), or omit the header. |
+| Client notifications are forwarded only to the caller's **passthrough** sessions; `notifications/initialized` and `notifications/cancelled` are not fanned out | Do not rely on the hub relaying client notifications to static-auth upstreams. |
+| `manifestCacheTtlSeconds` (default **60**) now caches each upstream's `*/list` answer | Expect up to 60s-stale catalogues. Set `manifestCacheTtlSeconds: 0` if lists must always be live. |
+| `diagnosticContinueFlow` is deprecated and ignored | Remove it when convenient; it never changed request flow in 0.2.x either. |
+
+Full notes: [`CHANGELOG.md`](CHANGELOG.md) (0.3.0–0.3.2).
+
+---
+
 ## Method dispatch
 
 | MCP method        | Where it's handled                            |

@@ -84,29 +84,20 @@ curl -sS https://agent-network-ingress-gw-b2jb0y.1d6nel.usa-e1.cloudhub.io/mcp-h
 
 curl -sS https://agent-network-ingress-gw-b2jb0y.1d6nel.usa-e1.cloudhub.io/mcp-hub-demo/mcp \
   -H 'content-type: application/json' \
-  -H 'mcp-session-id: <id-from-initialize>' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | jq .
 ```
 
 Expected: aggregated tools from all three upstreams, prefixed by
-server name (`erp.get_inventory`, `erp.submit_order`, `erp.submit_delivery`,
-`crm.<...>`, `agent-network-erp.check_inventory`).
+server name (`erp_get_inventory`, `erp_submit_order`, … — `_` separator
+since 0.2.3). No client `mcp-session-id` is required (hub is
+stateless toward clients since 0.3.0).
 
-### 3. Recall: the upstream session-id wiring is per-replica
+### 3. Upstream session-id sharing across replicas — shipped in 0.3.0
 
-The hub initializes each upstream lazily and caches the
-`mcp-session-id`. With multiple Flex replicas this means:
-
-- replica A initializes upstream X, gets session id S_A,
-- replica B receives the next call, doesn't have S_A in its cache,
-  initializes again, gets S_B,
-- the upstream may now have two sessions for the same logical client.
-
-For most upstreams that's fine (sessions are independent). For
-upstreams that gate state on the session id, this is wrong. Fix by
-moving the `upstream_sessions` map into the PDK shared cache (with a
-short TTL) so all replicas see the same id. This is a follow-up, not a
-blocker.
+Upstream `mcp-session-id` values now live in the PDK shared cache
+(per server, and per caller for `passthrough`), with
+`upstreamSessionTtlSeconds` and re-initialize on upstream 404. Each
+replica still has its own **manifest** cache; that remains expected.
 
 ### 4. Cap-token / route-trust mode (parity with `acp-to-a2a`)
 
@@ -158,15 +149,15 @@ curl -sSi -H 'content-type: application/json' \
   forward + `UpstreamCallResult` type
 - `Cargo.toml` — version 0.1.0 → 0.2.0
 
-## Open questions to discuss tomorrow
+## Open questions / resolved
 
-- Should the hub minted session id be deterministic (hash of inbound
-  IP + start time) or fully random? Current impl is SHA-256 of
-  `now_ns + hub_name`; collision-resistant but not stable across hub
-  restarts.
-- Do we want `tools/list` results to be cached at the hub-level too,
-  or strictly delegate caching to the upstream? If yes, the
-  `manifestCacheTtlSeconds` knob is wired up but currently inert.
+- ~~Should the hub minted session id be deterministic…~~ **Resolved in
+  0.3.0:** the hub is stateless toward clients (no `mcp-session-id`
+  issued). Upstream sessions live in the PDK shared cache.
+- ~~Do we want `tools/list` results cached…~~ **Resolved in 0.3.2:**
+  `manifestCacheTtlSeconds` caches each upstream's `*/list` answer
+  (per caller for passthrough). Aggregated second-level cache is
+  optional follow-up in `ROADMAP.md`.
 - Confirm we want `--isFlex` API instances to forbid the upstream
   health check when a policy fully short-circuits the request. May
   warrant an MUL ticket if this is gateway-level rather than a policy
