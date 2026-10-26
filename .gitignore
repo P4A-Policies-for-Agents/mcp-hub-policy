@@ -7,3 +7,5 @@ certificate.yaml
 policy-config.json
 dist
 .env
+*.log
+.DS_Store

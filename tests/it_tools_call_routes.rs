@@ -147,3 +147,77 @@ fn tools_call_unknown_server_returns_tool_not_found() {
     let code = v["error"]["code"].as_i64().expect("error code present");
     assert_eq!(code, -32011, "expected TOOL_NOT_FOUND, got {v:#}");
 }
+
+/// Server `a` has tool `b_c` and server `a_b` has tool `c`: both prefix to
+/// `a_b_c`. The call must reach the tool `tools/list` showed (first wins,
+/// i.e. `a`'s `b_c`), not the longest matching server prefix.
+type Calls = Rc<RefCell<Vec<String>>>;
+
+fn ambiguous_backend(tool: &'static str, called: Calls) -> RouterBackend {
+    RouterBackend::new(move |req| {
+        let b: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
+        let id = b["id"].as_str().unwrap_or("").to_string();
+        match b["method"].as_str().unwrap_or("") {
+            "tools/list" => json(200, &common::tools_list_response(&id, &[(tool, "t")])),
+            "tools/call" => {
+                called
+                    .borrow_mut()
+                    .push(b["params"]["name"].as_str().unwrap().to_string());
+                json(200, &rpc_result(&id, serde_json::json!({"content": []})))
+            }
+            _ => json(200, &rpc_result(&id, serde_json::json!({}))),
+        }
+    })
+}
+
+fn ambiguous_tester(a_b_enabled: bool, a: Calls, a_b: Calls) -> pdk_unit::UnitTest {
+    let cfg = serde_json::json!({
+        "mcpEndpoint": "/mcp",
+        "collisionStrategy": "prefix",
+        "mcpServers": [
+            {"name": "a", "endpoint": "http://a.test/mcp", "enabled": true, "authType": "none"},
+            {"name": "a_b", "endpoint": "http://ab.test/mcp", "enabled": a_b_enabled, "authType": "none"}
+        ]
+    });
+    UnitTestBuilder::default()
+        .with_config(cfg.to_string())
+        .with_http_upstream_from_authority("a.test", ambiguous_backend("b_c", a))
+        .with_http_upstream_from_authority("ab.test", ambiguous_backend("c", a_b))
+        .with_entrypoint(configure)
+}
+
+fn call(name: &str) -> UnitHttpRequest {
+    UnitHttpRequest::post()
+        .with_path("/mcp")
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": name, "arguments": {}}})
+            .to_string()
+            .into_bytes(),
+        )
+}
+
+#[test]
+fn ambiguous_prefix_routes_to_the_listed_tool() {
+    let (a, a_b): (Calls, Calls) = Default::default();
+    let mut t = ambiguous_tester(true, a.clone(), a_b.clone());
+    assert_eq!(t.request(call("a_b_c")).status_code(), 200);
+    assert_eq!(*a.borrow(), vec!["b_c"]);
+    assert!(
+        a_b.borrow().is_empty(),
+        "a_b must not run: {:?}",
+        a_b.borrow()
+    );
+}
+
+#[test]
+fn disabled_server_does_not_capture_a_prefix() {
+    let (a, a_b): (Calls, Calls) = Default::default();
+    let mut t = ambiguous_tester(false, a.clone(), a_b.clone());
+    let resp = t.request(call("a_b_c"));
+    assert_eq!(resp.status_code(), 200);
+    let b: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+    assert!(b.get("error").is_none(), "{b}");
+    assert_eq!(*a.borrow(), vec!["b_c"]);
+}

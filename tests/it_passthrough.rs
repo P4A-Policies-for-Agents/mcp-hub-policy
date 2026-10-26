@@ -383,16 +383,15 @@ fn static_auth_401_is_not_turned_into_a_client_challenge() {
     assert_eq!(body(&resp)["error"]["code"], -32010);
 }
 
-#[test]
-fn rejected_initialize_is_not_cached() {
-    let inits = Rc::new(RefCell::new(0u32));
-    let n = inits.clone();
-    let erp = RouterBackend::new(move |req| {
+/// `erp` whose `initialize` always fails with a JSON-RPC error; counts
+/// handshakes.
+fn rejecting_erp(inits: Rc<RefCell<u32>>) -> RouterBackend {
+    RouterBackend::new(move |req| {
         let b: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
         let id = b["id"].as_str().unwrap_or("").to_string();
         match b["method"].as_str().unwrap_or("") {
             "initialize" => {
-                *n.borrow_mut() += 1;
+                *inits.borrow_mut() += 1;
                 json(
                     200,
                     &serde_json::json!({"jsonrpc": "2.0", "id": id,
@@ -402,19 +401,58 @@ fn rejected_initialize_is_not_cached() {
             }
             _ => json(500, "must not be called without a session"),
         }
-    });
+    })
+}
+
+fn erp_call() -> UnitHttpRequest {
+    rpc(2, "tools/call", serde_json::json!({"name": "erp_orders"}))
+        .with_header("authorization", "Bearer alice")
+}
+
+#[test]
+fn rejected_initialize_is_backed_off() {
+    let inits = Rc::new(RefCell::new(0u32));
     let mut t = tester(
         policy_config(false),
         mcp_backend("search", false, Default::default()),
-        erp,
+        rejecting_erp(inits.clone()),
     );
-    let call = || {
+
+    let first = t.request(erp_call());
+    assert_eq!(first.status_code(), 200);
+    assert_eq!(body(&first)["error"]["code"], -32010);
+
+    let second = t.request(erp_call());
+    assert_eq!(second.status_code(), 503);
+    let retry: u64 = second.header("retry-after").unwrap().parse().unwrap();
+    assert!((1..=10).contains(&retry), "retry-after {retry}");
+    let b = body(&second);
+    assert_eq!(b["error"]["code"], -32010);
+    assert_eq!(b["error"]["data"]["reason"], "error");
+    assert_eq!(*inits.borrow(), 1, "backed-off upstream is not contacted");
+
+    // Backoff is per credential: another caller still gets a handshake.
+    t.request(
         rpc(2, "tools/call", serde_json::json!({"name": "erp_orders"}))
-            .with_header("authorization", "Bearer alice")
-    };
+            .with_header("authorization", "Bearer bob"),
+    );
+    assert_eq!(*inits.borrow(), 2);
+}
+
+#[test]
+fn backoff_zero_retries_every_handshake() {
+    let inits = Rc::new(RefCell::new(0u32));
+    let mut cfg: serde_json::Value = serde_json::from_str(&policy_config(false)).unwrap();
+    cfg["upstreamFailureBackoffSeconds"] = 0.into();
+    let mut t = tester(
+        cfg.to_string(),
+        mcp_backend("search", false, Default::default()),
+        rejecting_erp(inits.clone()),
+    );
 
     for _ in 0..2 {
-        let resp = t.request(call());
+        let resp = t.request(erp_call());
+        assert_eq!(resp.status_code(), 200);
         assert!(body(&resp)["error"].is_object());
     }
     assert_eq!(*inits.borrow(), 2, "each call retries the handshake");
@@ -451,4 +489,138 @@ fn outbound_request_ids_are_unique() {
     let unique: std::collections::HashSet<_> = ids.iter().collect();
     assert_eq!(ids.len(), 4, "initialize + 3 calls: {ids:?}");
     assert_eq!(unique.len(), ids.len(), "{ids:?}");
+}
+
+/// Client ID enforcement upstream: `headerName` lists two headers; both
+/// must reach the upstream, and a caller missing either is challenged.
+#[test]
+fn passthrough_forwards_every_listed_header() {
+    let cfg = {
+        let mut v: serde_json::Value = serde_json::from_str(&policy_config(false)).unwrap();
+        v["mcpServers"][1]["headerName"] = "client_id, Client_Secret".into();
+        v.to_string()
+    };
+    type Seen = Rc<RefCell<Vec<(Option<String>, Option<String>)>>>;
+    let seen: Seen = Default::default();
+    let log = seen.clone();
+    let erp = RouterBackend::new(move |req| {
+        let (cid, secret) = (header(&req, "client_id"), header(&req, "client_secret"));
+        log.borrow_mut().push((cid.clone(), secret.clone()));
+        if cid.is_none() || secret.is_none() {
+            return json(401, "{}").with_header("www-authenticate", "Client-ID-Enforcement");
+        }
+        let b: serde_json::Value = serde_json::from_slice(req.body()).unwrap();
+        let id = b["id"].as_str().unwrap_or("").to_string();
+        match b["method"].as_str().unwrap_or("") {
+            "tools/list" => json(200, &tools_list_response(&id, &[("orders", "a tool")])),
+            "notifications/initialized" => UnitHttpResponse::new(202),
+            _ => json(200, &rpc_result(&id, serde_json::json!({}))),
+        }
+    });
+    let mut t = tester(cfg, mcp_backend("search", false, Default::default()), erp);
+
+    let resp = t.request(
+        rpc(1, "tools/list", serde_json::json!({}))
+            .with_header("client_id", "app")
+            .with_header("client_secret", "s3cret"),
+    );
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(body(&resp)["result"]["tools"].as_array().unwrap().len(), 2);
+    assert!(!seen.borrow().is_empty());
+    assert!(seen
+        .borrow()
+        .iter()
+        .all(|h| *h == (Some("app".into()), Some("s3cret".into()))));
+
+    // Only one of the two headers: the server is skipped / challenged.
+    seen.borrow_mut().clear();
+    let resp = t.request(
+        rpc(2, "tools/call", serde_json::json!({"name": "erp_orders"}))
+            .with_header("client_id", "app"),
+    );
+    assert_eq!(resp.status_code(), 401);
+    assert!(seen.borrow().is_empty(), "erp must not be called");
+}
+
+/// Hub with protected-resource metadata, `erp` behind Client ID
+/// Enforcement (`client_id, client_secret` passthrough).
+fn client_id_config() -> String {
+    let mut v: serde_json::Value = serde_json::from_str(&policy_config(true)).unwrap();
+    v["mcpServers"][1]["headerName"] = "client_id, client_secret".into();
+    v.to_string()
+}
+
+#[test]
+fn missing_client_id_header_is_not_an_oauth_challenge() {
+    let mut t = tester(
+        client_id_config(),
+        mcp_backend("search", false, Default::default()),
+        mcp_backend("orders", false, Default::default()),
+    );
+
+    let resp = t.request(
+        rpc(2, "tools/call", serde_json::json!({"name": "erp_orders"}))
+            .with_header("client_id", "app"),
+    );
+    assert_eq!(resp.status_code(), 401);
+    assert_eq!(
+        resp.header("www-authenticate"),
+        None,
+        "no OAuth challenge for a non-Authorization passthrough"
+    );
+    let b = body(&resp);
+    assert_eq!(b["error"]["code"], -32014);
+    assert_eq!(
+        b["error"]["data"],
+        serde_json::json!({"server": "erp", "reason": "missing_credentials",
+            "missingHeaders": ["client_secret"]})
+    );
+    assert!(b["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("client_secret"));
+}
+
+#[test]
+fn client_id_upstream_challenge_is_relayed_even_with_hub_metadata() {
+    let erp = RouterBackend::new(|_req| {
+        json(401, "{}").with_header("www-authenticate", "Client-ID-Enforcement")
+    });
+    let mut t = tester(
+        client_id_config(),
+        mcp_backend("search", false, Default::default()),
+        erp,
+    );
+
+    let resp = t.request(
+        rpc(2, "tools/call", serde_json::json!({"name": "erp_orders"}))
+            .with_header("client_id", "app")
+            .with_header("client_secret", "wrong"),
+    );
+    assert_eq!(resp.status_code(), 401);
+    assert_eq!(
+        resp.header("www-authenticate"),
+        Some("Client-ID-Enforcement")
+    );
+}
+
+#[test]
+fn empty_passthrough_header_counts_as_missing() {
+    let erp_log: Log = Default::default();
+    let mut t = tester(
+        client_id_config(),
+        mcp_backend("search", false, Default::default()),
+        mcp_backend("orders", false, erp_log.clone()),
+    );
+    let resp = t.request(
+        rpc(2, "tools/call", serde_json::json!({"name": "erp_orders"}))
+            .with_header("client_id", "app")
+            .with_header("client_secret", " "),
+    );
+    assert_eq!(resp.status_code(), 401);
+    assert_eq!(
+        body(&resp)["error"]["data"]["missingHeaders"],
+        serde_json::json!(["client_secret"])
+    );
+    assert!(erp_log.borrow().is_empty());
 }

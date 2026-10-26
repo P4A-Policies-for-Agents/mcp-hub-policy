@@ -12,6 +12,8 @@
 //! Output of [`aggregate`] is the JSON array ready to be wrapped in the
 //! corresponding response key (`{"tools": [...]}` etc.).
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::config::CollisionStrategy;
@@ -33,7 +35,8 @@ pub fn aggregate(
     strategy: CollisionStrategy,
 ) -> Result<Vec<Value>, AggregateError> {
     let mut out: Vec<Value> = Vec::with_capacity(items.len());
-    let mut seen: Vec<(String, usize)> = Vec::new(); // (name, index in `out`)
+    // Output name -> index in `out`.
+    let mut seen: HashMap<String, usize> = HashMap::with_capacity(items.len());
 
     for item in items {
         let UpstreamItem { server, value } = item;
@@ -59,37 +62,35 @@ pub fn aggregate(
                 // `^[a-zA-Z0-9_-]{1,64}$`, which forbids `.`.
                 let prefixed = format!("{server}_{original_name}");
                 entry["name"] = Value::String(prefixed.clone());
-                if seen.iter().any(|(n, _)| n == &prefixed) {
+                if seen.contains_key(&prefixed) {
                     // Two servers prefixed to the same name (same server
                     // name + same tool name) — fall back to firstWins.
                     continue;
                 }
-                seen.push((prefixed, out.len()));
+                seen.insert(prefixed, out.len());
                 out.push(entry);
             }
             CollisionStrategy::Reject => {
-                if let Some((dup, _)) = seen.iter().find(|(n, _)| n == &original_name) {
-                    return Err(AggregateError::Duplicate(dup.clone()));
+                if seen.contains_key(&original_name) {
+                    return Err(AggregateError::Duplicate(original_name));
                 }
-                seen.push((original_name, out.len()));
+                seen.insert(original_name, out.len());
                 out.push(entry);
             }
             CollisionStrategy::FirstWins => {
-                if seen.iter().any(|(n, _)| n == &original_name) {
+                if seen.contains_key(&original_name) {
                     continue;
                 }
-                seen.push((original_name, out.len()));
+                seen.insert(original_name, out.len());
                 out.push(entry);
             }
-            CollisionStrategy::LastWins => {
-                if let Some((_, idx)) = seen.iter().find(|(n, _)| n == &original_name) {
-                    let i = *idx;
-                    out[i] = entry;
-                } else {
-                    seen.push((original_name, out.len()));
+            CollisionStrategy::LastWins => match seen.get(&original_name) {
+                Some(&i) => out[i] = entry,
+                None => {
+                    seen.insert(original_name, out.len());
                     out.push(entry);
                 }
-            }
+            },
         }
     }
 

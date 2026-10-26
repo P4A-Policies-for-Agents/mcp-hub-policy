@@ -62,7 +62,9 @@ spec:
         Per-upstream timeout (ms) when aggregating manifests
         (`tools/list`, `resources/list`, `prompts/list`). Upstreams are
         queried concurrently; slow upstreams are skipped with a warning
-        rather than failing the aggregate.
+        rather than failing the aggregate. One budget covers the whole
+        upstream call, including the session handshake (`initialize`,
+        `notifications/initialized`).
     perRequestTimeoutMs:
       type: integer
       minimum: 100
@@ -70,7 +72,9 @@ spec:
       default: 30000
       description: |
         Per-upstream timeout (ms) for routed `tools/call`,
-        `resources/read`, `prompts/get` invocations.
+        `resources/read`, `prompts/get` invocations. One budget covers the
+        whole upstream call, including the session handshake and a retry
+        after an expired upstream session.
     manifestCacheTtlSeconds:
       type: integer
       minimum: 0
@@ -108,6 +112,64 @@ spec:
         checks to a gateway CORS policy.
       items:
         type: string
+    forwardHeaders:
+      type: array
+      description: |
+        Inbound headers copied to the upstream of every routed call
+        (`tools/call`, `resources/read`, `prompts/get`) when the caller sends
+        them, for tracing and correlation. Not sent on handshakes, `*/list`
+        or notifications. When unset, defaults to
+        `traceparent`, `tracestate` and `x-correlation-id`; set an empty
+        list to forward none. Transport headers, `authorization`,
+        `proxy-authorization`, `cookie` and any header a server uses for
+        authentication (including `customHeaders` entries) can't be
+        listed. A server's own `headers` entry of the same name wins.
+      items:
+        type: string
+    upstreamFailureBackoffSeconds:
+      type: integer
+      minimum: 0
+      maximum: 3600
+      default: 10
+      description: |
+        After an upstream fails its MCP handshake (unreachable or timed
+        out, HTTP 408/429/5xx, JSON-RPC error, invalid answer), skip it
+        for up to this many seconds instead of waiting on it again:
+        `*/list` leaves it out and routed calls answer 503 with
+        `Retry-After`. A shorter upstream `Retry-After` wins. A timeout
+        only skips calls allowed as long or less, so a `*/list` timeout
+        doesn't block routed calls. Other 4xx (which one caller's headers
+        could cause) and 401/403 are not backed off. Tracked per caller
+        credential for `authType=passthrough` servers. 0 disables it.
+    exposeUpstreamErrors:
+      type: boolean
+      default: false
+      description: |
+        When true, `*/list` results name the servers that were left out
+        and why in `_meta["mcp-hub/skipped"]` (reason codes
+        `missing_credentials`, `unauthorized`, `unavailable`, `error`,
+        `misconfigured`), and routed-call errors include up to 1 KB of the
+        upstream's HTTP error body in `error.data.body`. Off by default
+        because it reveals upstream details to callers.
+    maxUpstreamResponseBytes:
+      type: integer
+      minimum: 1048576
+      maximum: 67108864
+      default: 8388608
+      description: |
+        Largest upstream response body (bytes) the hub parses and relays;
+        larger answers fail with a JSON-RPC error naming the server.
+        Default 8 MiB, range 1 MiB to 64 MiB.
+    requireCallerAuth:
+      type: boolean
+      default: false
+      description: |
+        When true, every MCP POST without an `Authorization` header is
+        answered 401 with `WWW-Authenticate` (pointing at the hub's
+        protected-resource metadata when `authorizationServers` is set),
+        so MCP clients start their OAuth flow when they connect. Only the
+        header's presence is checked: validate tokens with a JWT policy or
+        at the passthrough upstream.
 
     # ------------------------------------------------------------------
     # OAuth protected-resource metadata (RFC 9728)
@@ -153,7 +215,8 @@ spec:
             description: |
               Logical server identifier. Used as the prefix when
               `collisionStrategy=prefix` and as the routing key for
-              `<server>_<tool>` invocations. Must be unique.
+              `<server>_<tool>` invocations. Must be unique and contain only
+              letters, digits, `_` and `-`.
           endpoint:
             type: string
             format: service
@@ -185,8 +248,10 @@ spec:
               - basicAuth: `Authorization: Basic base64(username:password)`.
               - apiKeyHeader: `<headerName>: <apiKey>`.
               - customHeaders: arbitrary headers from the `headers` array.
-              - passthrough: forward the caller's own inbound header
+              - passthrough: forward the caller's own inbound header(s)
                 (`headerName`, default `Authorization`) to this server only.
+                List several comma-separated (e.g. `client_id, client_secret`
+                for Client ID Enforcement); all must be present.
                 Use when the caller's token is valid for the upstream as-is
                 (e.g. a gateway in the same trust domain). Note: this is the
                 MCP "token passthrough" pattern; it relies on the upstream
@@ -214,7 +279,8 @@ spec:
             description: |
               API-key header name (e.g. `x-api-key`). Required when
               `authType=apiKeyHeader`. With `authType=passthrough`, the
-              inbound header to forward (default `authorization`).
+              inbound header(s) to forward, comma-separated (default
+              `authorization`; e.g. `client_id, client_secret`).
           apiKey:
             type: string
             "@context":
@@ -226,8 +292,11 @@ spec:
             type: array
             description: |
               Additional HTTP headers attached to every outbound call to
-              this server. When `authType=customHeaders`, the auth
-              materials are sourced from this array.
+              this server; an entry replaces any header of the same name
+              the hub would send (auth scheme, passthrough, forwarded).
+              Transport headers can't be set. When
+              `authType=customHeaders`, the auth materials are sourced
+              from this array.
             items:
               type: object
               properties:
