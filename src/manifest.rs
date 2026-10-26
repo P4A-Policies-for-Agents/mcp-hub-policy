@@ -7,10 +7,11 @@
 //!     credential hash), so `authType=passthrough` results are per caller,
 //!     raw tokens never land in shared memory, and a configuration change
 //!     never serves entries cached under the old one.
-//!   * Only successful answers are cached: a failing or unauthorized
+//!   * Only successful answers are cached (an upstream without the list
+//!     method counts, as an empty list): a failing or unauthorized
 //!     upstream is asked again on the next call.
 //!   * The PDK cache bounds entry count, not bytes, so answers larger than
-//!     [`MAX_ENTRY_BYTES`] are not cached.
+//!     the cache's `max_entry_bytes` are not cached.
 //!   * Entries carry an expiry stamp; the PDK 1.8 cache has no native TTL.
 
 use pdk::cache::Cache;
@@ -18,9 +19,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::session::now_seconds;
-
-/// Largest serialized answer that is cached (bytes).
-pub const MAX_ENTRY_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 struct Entry {
@@ -39,13 +37,16 @@ struct EntryRef<'a> {
 pub struct ManifestCache {
     cache: Box<dyn Cache>,
     ttl_seconds: u64,
+    /// Largest serialized answer that is cached (bytes).
+    max_entry_bytes: usize,
 }
 
 impl ManifestCache {
-    pub fn new(cache: impl Cache + 'static, ttl_seconds: u32) -> Self {
+    pub fn new(cache: impl Cache + 'static, ttl_seconds: u32, max_entry_bytes: usize) -> Self {
         Self {
             cache: Box::new(cache),
             ttl_seconds: ttl_seconds as u64,
+            max_entry_bytes,
         }
     }
 
@@ -81,10 +82,11 @@ impl ManifestCache {
             exp: now_seconds() + self.ttl_seconds,
         };
         let bytes = serde_json::to_vec(&entry).expect("manifest entry serializes");
-        if bytes.len() > MAX_ENTRY_BYTES {
+        if bytes.len() > self.max_entry_bytes {
             pdk::logger::debug!(
-                "mcp-hub: manifest answer of {} bytes not cached (limit {MAX_ENTRY_BYTES})",
-                bytes.len()
+                "mcp-hub: manifest answer of {} bytes not cached (limit {})",
+                bytes.len(),
+                self.max_entry_bytes
             );
             return;
         }

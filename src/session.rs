@@ -16,6 +16,9 @@
 //!   * Entries carry an expiry stamp; the PDK 1.8 cache has no native TTL.
 //!   * An empty session id records "initialized, upstream issued no id" so
 //!     session-less servers aren't re-initialized on every call.
+//!   * A failed handshake is remembered under the same key for
+//!     `upstreamFailureBackoffSeconds`, so a dead upstream isn't waited on
+//!     by every request.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,14 +26,39 @@ use pdk::cache::Cache;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// An upstream MCP session as the hub negotiated it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Session {
+    /// `mcp-session-id`; empty when the upstream issued none.
+    pub id: String,
+    /// Protocol version the upstream answered `initialize` with; empty
+    /// when it didn't say.
+    pub protocol_version: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Entry {
     sid: String,
+    #[serde(default)]
+    ver: String,
     /// Expiry, seconds since the Unix epoch.
     exp: u64,
 }
 
-/// TTL-bounded upstream session ids, keyed by [`SessionStore::key`].
+#[derive(Serialize, Deserialize)]
+struct Failure {
+    /// Skip reason code reported while backing off.
+    reason: String,
+    /// End of the backoff, seconds since the Unix epoch.
+    exp: u64,
+    /// Timeout the failure happened under, when it was one: only calls
+    /// allowed as long or less are backed off. `None` backs off all.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// TTL-bounded upstream sessions and handshake failures, keyed by
+/// [`SessionStore::key`].
 pub struct SessionStore {
     cache: Box<dyn Cache>,
     ttl_seconds: u64,
@@ -56,11 +84,68 @@ impl SessionStore {
         }
     }
 
-    /// Cached session id; `Some("")` means the upstream issued none.
-    pub fn get(&self, key: &str) -> Option<String> {
+    /// Cached session, if present and not expired.
+    pub fn get(&self, key: &str) -> Option<Session> {
+        let entry: Entry = self.read(key, |e: &Entry| e.exp)?;
+        Some(Session {
+            id: entry.sid,
+            protocol_version: entry.ver,
+        })
+    }
+
+    /// Remember a session. A TTL of 0 disables reuse.
+    pub fn put(&self, key: &str, session: &Session) {
+        if self.ttl_seconds == 0 {
+            return;
+        }
+        let entry = Entry {
+            sid: session.id.clone(),
+            ver: session.protocol_version.clone(),
+            exp: now_seconds() + self.ttl_seconds,
+        };
+        self.write(key, &entry);
+    }
+
+    pub fn remove(&self, key: &str) {
+        self.cache.delete(key);
+    }
+
+    /// Skip the upstream behind `key` for `seconds`, reporting `reason`.
+    /// With `timeout_ms`, only calls whose timeout is at most that are
+    /// skipped (a call with more time may still succeed).
+    pub fn record_failure(&self, key: &str, reason: &str, seconds: u64, timeout_ms: Option<u64>) {
+        if seconds == 0 {
+            return;
+        }
+        let failure = Failure {
+            reason: reason.to_string(),
+            exp: now_seconds() + seconds,
+            timeout_ms,
+        };
+        self.write(&failure_key(key), &failure);
+    }
+
+    /// Active backoff for `key` covering a call with `timeout_ms`:
+    /// (reason, seconds left, at least 1).
+    pub fn failure(&self, key: &str, timeout_ms: u64) -> Option<(String, u64)> {
+        let failure: Failure = self.read(&failure_key(key), |f: &Failure| f.exp)?;
+        if failure.timeout_ms.is_some_and(|t| timeout_ms > t) {
+            return None;
+        }
+        let left = failure.exp.saturating_sub(now_seconds()).max(1);
+        Some((failure.reason, left))
+    }
+
+    /// Unexpired value under `key`; expired or unreadable entries are
+    /// deleted.
+    fn read<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+        exp: impl Fn(&T) -> u64,
+    ) -> Option<T> {
         let bytes = self.cache.get(key)?;
-        match serde_json::from_slice::<Entry>(&bytes) {
-            Ok(entry) if entry.exp > now_seconds() => Some(entry.sid),
+        match serde_json::from_slice::<T>(&bytes) {
+            Ok(value) if exp(&value) > now_seconds() => Some(value),
             _ => {
                 self.cache.delete(key);
                 None
@@ -68,26 +153,18 @@ impl SessionStore {
         }
     }
 
-    /// Remember a session id. A TTL of 0 disables reuse.
-    pub fn put(&self, key: &str, sid: &str) {
-        if self.ttl_seconds == 0 {
-            return;
-        }
-        let entry = Entry {
-            sid: sid.to_string(),
-            exp: now_seconds() + self.ttl_seconds,
-        };
-        let bytes = serde_json::to_vec(&entry).expect("session entry serializes");
+    fn write(&self, key: &str, value: &impl Serialize) {
+        let bytes = serde_json::to_vec(value).expect("session entry serializes");
         if let Err(e) = self.cache.save(key, bytes) {
             // Contention on the shared cache is harmless: the next call
             // simply re-initializes.
             pdk::logger::debug!("mcp-hub: session cache save failed: {e:?}");
         }
     }
+}
 
-    pub fn remove(&self, key: &str) {
-        self.cache.delete(key);
-    }
+fn failure_key(key: &str) -> String {
+    format!("{key}|failed")
 }
 
 /// Short hash of the raw policy configuration, used to scope cache keys.

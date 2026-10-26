@@ -4,6 +4,133 @@ All notable changes to `mcp-hub-policy`. The 0.2.x line is the first
 shippable, MCP-client-compatible release; 0.1.0 was an internal
 preview.
 
+## [0.3.5] — 2026-10-26
+
+### Added
+
+- `maxUpstreamResponseBytes` (default 8 MiB, 1–64 MiB): a larger
+  upstream answer fails with `-32603` naming the server instead of being
+  parsed and relayed.
+- `requireCallerAuth` (default false): an MCP POST without
+  `Authorization` gets HTTP 401 with `WWW-Authenticate` (pointing at the
+  protected-resource metadata when configured), so MCP clients start
+  their OAuth flow on connect. Only presence is checked.
+- `resources/templates/list` answers `{"resourceTemplates": []}`
+  (was `-32601`).
+- The protected-resource metadata is also served at the RFC 9728 path
+  form `/.well-known/oauth-protected-resource/<path>`.
+
+### Changed
+
+- `forwardHeaders` are sent on routed calls (`tools/call`,
+  `resources/read`, `prompts/get`) only, not on the session handshake,
+  `*/list` or notifications: those are shared by every caller of a
+  static-auth server and cached without regard to the headers.
+- `GET` on the MCP endpoint always answers 405 with `Allow: POST`
+  (SSE clients got an empty stream that ended at once, which makes
+  clients reconnect in a loop).
+- One timeout budget (`aggregationTimeoutMs` / `perRequestTimeoutMs` /
+  `timeoutMs`) covers the whole upstream call — handshake, call and the
+  retry after an expired session — instead of each HTTP request. A
+  session the call just opened is kept when the call itself times out,
+  and running out of time on the retry handshake starts no backoff.
+- Static-auth and per-caller (`passthrough`) sessions and manifests use
+  separate caches, so callers sending many distinct tokens can no longer
+  evict the entries every caller shares. Static-auth `*/list` answers up
+  to 512 KB are cached (was 64 KB; per-caller answers stay at 64 KB).
+- An upstream answering `-32601` to a `*/list` method counts as an empty
+  list: it is cached and no longer logged or reported as skipped.
+- Server names may contain only letters, digits, `_` and `-`; other
+  names take the server out of service. Prefixed tool or prompt names
+  over 64 characters are logged as a warning.
+- JSON-RPC: batches, `"id": null` (or a non-string, non-number id) and a
+  missing `method` answer `-32600`; a JSON-RPC response from the client
+  gets 202.
+- A caller without a passthrough credential is logged at debug level
+  (was warn) when a `*/list` skips the server.
+
+### Fixed
+
+- An SSE upstream's `content-type` is matched case-insensitively.
+
+## [0.3.4] — 2026-10-26
+
+### Added
+
+- `forwardHeaders` (default `traceparent`, `tracestate`,
+  `x-correlation-id`): caller headers copied to every upstream.
+  Credential, transport and server-auth headers can't be listed.
+- `upstreamFailureBackoffSeconds` (default 10, `0` = off): after an
+  upstream handshake fails, the upstream isn't contacted again for that
+  long (per server, per caller for `passthrough`); routed calls get
+  HTTP 503 with `Retry-After`. Only failures a caller can't cause count
+  (unreachable / timeout, 408, 429, 5xx, JSON-RPC error, invalid
+  answer); a shorter upstream `Retry-After` wins; a timeout only backs
+  off calls with the same or a shorter timeout.
+- `exposeUpstreamErrors` (default false): adds the first 1 KB of an
+  upstream HTTP error body to `error.data.body` and lists servers a
+  `*/list` left out in `result._meta["mcp-hub/skipped"]`.
+- Routed-call errors carry `error.data.reason` (`missing_credentials`,
+  `unauthorized`, `unavailable`, `error`, `misconfigured`).
+
+### Changed
+
+- Upstream 429 and 5xx keep their HTTP status and `Retry-After`
+  (previously HTTP 200). Other upstream HTTP errors still answer
+  `-32010` on HTTP 200, with `error.data.httpStatus`.
+- The hub requests MCP `2025-06-18` from upstreams, adopts the version
+  each upstream answers with and sends it as `MCP-Protocol-Version`.
+- An invalid `mcpServers` entry no longer rejects the whole policy: it
+  is logged and taken out of service (`*/list` skip it, its calls get
+  `-32010` with the reason). Invalid hub-wide settings fail closed —
+  every MCP request gets HTTP 503 with the reason — instead of failing
+  policy start-up. Duplicate server names isolate every copy.
+- A `passthrough` server whose `headers` override every passthrough
+  header is rejected as misconfigured (use `customHeaders`).
+- A `jsonrpc` other than `"2.0"` answers `-32600` (was `-32700`).
+- A server's `headers` entry replaces any same-named header the hub
+  would send (it was sent in addition, e.g. two `Authorization`
+  values); transport headers in `headers` make the server invalid.
+- `forwardHeaders` can't list headers of `customHeaders` servers or of
+  invalid entries.
+- An upstream that fails at the transport level mid-session is
+  re-initialized on the next call (so the backoff applies).
+- More hop-by-hop headers (`keep-alive`, `upgrade`, `te`, `trailer`,
+  `expect`, `proxy-connection`, pseudo-headers) are reserved.
+
+### Fixed
+
+- A request method sent without an `id` (e.g. `tools/call`) is no longer
+  forwarded to upstreams as a notification; only `notifications/*` are.
+- Outbound JSON-RPC ids include a random per-worker part, so workers
+  sharing an upstream session cannot send duplicate ids.
+- Passthrough servers on headers other than `Authorization` (e.g.
+  `client_id, client_secret`) no longer answer 401s with the hub's OAuth
+  `Bearer resource_metadata=…` challenge. The upstream's own challenge
+  (e.g. `Client-ID-Enforcement`) is relayed; a call missing a header gets
+  HTTP 401 without a challenge, and `error.data.missingHeaders` names
+  what is missing. The error message now lists the missing headers.
+- An empty passthrough header value counts as missing.
+- `prefix` routing: when several servers' prefixes match a name (server
+  `a` + tool `b_c` vs server `a_b` + tool `c`), the call goes to the
+  entry `tools/list` showed instead of the longest server prefix, which
+  could run a different tool. Disabled servers no longer take part in
+  prefix matching.
+- The upstream handshake (`initialize`) uses the calling request's
+  timeout, so a dead upstream can't hold `*/list` past
+  `aggregationTimeoutMs` (it waited up to `perRequestTimeoutMs`).
+
+## [0.3.3] — 2026-10-23
+
+### Fixed
+
+- `authType: passthrough` can forward several caller headers:
+  `headerName` takes a comma-separated list (e.g.
+  `client_id, client_secret` for an upstream behind Client ID
+  Enforcement). All listed headers must be present; otherwise list
+  calls skip the server and routed calls return HTTP 401. Previously
+  only one header was forwarded, so such upstreams always answered 401.
+
 ## [0.3.2] — 2026-10-16
 
 ### Added

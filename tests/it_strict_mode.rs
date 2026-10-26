@@ -63,10 +63,9 @@ fn plain_get_on_mcp_returns_405() {
 }
 
 #[test]
-fn sse_get_on_mcp_returns_event_stream() {
-    // SSE clients (MCP Inspector legacy fallback, EventSource probes)
-    // send `Accept: text/event-stream`. Respond 200 with an empty SSE
-    // stream so the client connects without error.
+fn sse_get_on_mcp_returns_405() {
+    // The hub sends no server-initiated messages, so it offers no GET
+    // stream; MCP clients fall back to POST-only on 405.
     let upstream = RouterBackend::new(|_req| json(500, "should not be called"));
 
     let mut tester = UnitTestBuilder::default()
@@ -79,12 +78,6 @@ fn sse_get_on_mcp_returns_event_stream() {
         .with_header("accept", "text/event-stream");
     let resp = tester.request(req);
 
-    assert_eq!(resp.status_code(), 200);
-    let ct = resp
-        .headers()
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
-    assert_eq!(ct, "text/event-stream");
+    assert_eq!(resp.status_code(), 405);
+    assert_eq!(resp.header("allow"), Some("POST"));
 }

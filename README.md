@@ -44,26 +44,40 @@ and routing the invocation calls (`tools/call`, `resources/read`,
   `headers[].value` are `security:sensitive`, so API Manager masks them.
 - **Per-user token passthrough.** `authType: passthrough` forwards the
   caller's `Authorization` header (or `headerName`) to that upstream
-  only.
+  only. `headerName` may list several comma-separated headers, e.g.
+  `client_id, client_secret` for a Client ID Enforcement upstream; all
+  must be present.
 - **Mixed-auth aggregation.** `tools/list` returns everything from the
   upstreams that answered; upstreams that need a token the caller
   didn't send, or rejected it, are skipped.
 - **OAuth-ready challenges.** A routed call to a passthrough upstream
   without a valid token gets HTTP 401/403 with `WWW-Authenticate`;
-  optional RFC 9728 protected-resource metadata is served by the policy.
+  optional RFC 9728 protected-resource metadata is served by the policy,
+  and `requireCallerAuth` challenges callers on connect.
 - **Fast discovery.** `*/list` calls query all upstreams concurrently;
   each upstream's answer is cached for `manifestCacheTtlSeconds` (per
   caller for `passthrough` servers).
 - **Collision handling.** Duplicate names across upstreams are
   disambiguated automatically (default: prefix with the server name).
 - **Spec-compliant MCP Streamable HTTP.** Protocol-version negotiation,
-  `notifications/initialized` (202), `GET` for SSE clients, stateless
-  client sessions, tool names matching `^[a-zA-Z0-9_-]{1,64}$`.
+  `notifications/initialized` (202), POST-only transport (`GET` gets
+  405), stateless client sessions, tool names matching
+  `^[a-zA-Z0-9_-]{1,64}$`.
 - **Upstream session management.** Sessions are reused per server (per
   user for passthrough), expire after a TTL and are re-established
   automatically.
 - **Operational safety.** Slow, failing or unauthorized upstreams are
-  skipped during aggregation; routed calls have per-request timeouts.
+  skipped during aggregation; each upstream call has one timeout
+  budget, handshake included; answers over `maxUpstreamResponseBytes`
+  are refused.
+  A failed upstream handshake is backed off for
+  `upstreamFailureBackoffSeconds`; upstream 429 / 5xx keep their status
+  and `Retry-After`. A misconfigured server entry only takes that server
+  out of service; invalid hub-wide settings fail closed (HTTP 503).
+- **Trace propagation.** `traceparent`, `tracestate` and
+  `x-correlation-id` (configurable with `forwardHeaders`) reach the
+  upstream of every routed call. `exposeUpstreamErrors` adds upstream error bodies and the
+  names of skipped servers to responses.
 
 The full configuration reference — authentication, mixed-auth
 behaviour, collision strategies, settings, methods, limitations and
@@ -136,6 +150,7 @@ collisionStrategy:     prefix
 aggregationTimeoutMs:  5000
 perRequestTimeoutMs:   30000
 manifestCacheTtlSeconds: 60     # 0 = always ask the upstreams
+upstreamFailureBackoffSeconds: 10   # 0 = retry a failed upstream on every call
 mcpServers:
   - name:      erp
     endpoint:  https://erp-mcp.example.com/mcp
@@ -230,7 +245,7 @@ usually load unchanged. **MCP clients** may see behaviour differences:
 | `manifestCacheTtlSeconds` (default **60**) now caches each upstream's `*/list` answer | Expect up to 60s-stale catalogues. Set `manifestCacheTtlSeconds: 0` if lists must always be live. |
 | `diagnosticContinueFlow` is deprecated and ignored | Remove it when convenient; it never changed request flow in 0.2.x either. |
 
-Full notes: [`CHANGELOG.md`](CHANGELOG.md) (0.3.0–0.3.2).
+Full notes: [`CHANGELOG.md`](CHANGELOG.md) (0.3.0–0.3.5).
 
 ---
 
@@ -246,9 +261,11 @@ Full notes: [`CHANGELOG.md`](CHANGELOG.md) (0.3.0–0.3.2).
 | `resources/read`  | Route by `uri` to the server that listed it   |
 | `prompts/list`    | Aggregate                                     |
 | `prompts/get`     | Route                                         |
+| `resources/templates/list` | Local, always empty                  |
 | `notifications/*` | 202; forwarded best-effort to passthrough upstreams where the caller has a session |
 | anything else     | `METHOD_NOT_FOUND`                            |
-| `GET /mcp`        | 200 + empty `text/event-stream` for SSE clients; otherwise 405 + `Allow: POST` |
+| `GET /mcp`        | 405 + `Allow: POST` (no server-initiated stream) |
+| batches, `id: null`, no `method` | `-32600`; a client JSON-RPC response gets 202 |
 
 ## Limits and known limitations
 
@@ -258,6 +275,9 @@ Full notes: [`CHANGELOG.md`](CHANGELOG.md) (0.3.0–0.3.2).
   50-server test on CloudHub (public MCP servers), a cold `tools/list`
   took about 0.5–5 s and a cached one about 0.1–0.3 s. Each gateway
   replica has its own cache.
+- Upstream sessions and the failure backoff are also kept per gateway
+  replica: with N replicas a down upstream is tried up to N times per
+  `upstreamFailureBackoffSeconds` window.
 - Cached `passthrough` lists are not re-checked against the caller's
   token, so a revoked token can still see the list until it expires.
   Routed calls always go to the upstream with the caller's token.
@@ -266,8 +286,28 @@ Full notes: [`CHANGELOG.md`](CHANGELOG.md) (0.3.0–0.3.2).
   found only when the caller sends a token; without one the read returns
   `RESOURCE_NOT_FOUND` (`-32012`), not HTTP 401.
 - Only the first page of each upstream's list is returned.
-- Responses are buffered, not streamed; notifications an SSE upstream
-  sends before its result are dropped.
+- Responses are buffered, not streamed; progress and log notifications
+  an SSE upstream sends before its result are dropped, and
+  `notifications/cancelled` is not forwarded (the hub uses its own
+  request ids upstream).
+- Upstream 429 / 5xx keep their status and `Retry-After`; other upstream
+  HTTP errors besides passthrough 401/403 become JSON-RPC `-32010` on
+  HTTP 200 (an HTTP 404 would make clients drop their session). The
+  upstream body is relayed only with `exposeUpstreamErrors`.
+- Only the auth headers and `forwardHeaders` reach upstreams, and
+  `forwardHeaders` only on routed calls; upstream response headers other
+  than `Retry-After` don't reach the client.
+- The gateway buffers each upstream answer before the hub sees it;
+  `maxUpstreamResponseBytes` stops the hub parsing and relaying a larger
+  one, not the gateway receiving it.
+- `passthrough` gives each distinct caller credential its own upstream
+  session and cached lists. Put JWT validation and rate limiting in front
+  of the hub so unauthenticated callers can't open sessions on your
+  upstreams with made-up tokens.
+- Static-auth upstreams share one upstream MCP session across callers.
+- Non-`Authorization` passthrough (e.g. `client_id, client_secret`):
+  the upstream's 401 challenge is relayed; a missing header gives HTTP
+  401 without an OAuth challenge and `error.data.missingHeaders`.
 
 ## Collision handling
 
@@ -301,7 +341,7 @@ mcp-hub-policy/
 │   │   ├── types.rs      # serverInfo, capabilities
 │   │   └── aggregate.rs  # collision-aware manifest merge
 │   └── generated/        # codegen mirror (auto-regen by `make build`)
-└── tests/                # integration tests (with the unit tests in src/: 77)
+└── tests/                # integration tests (with the unit tests in src/: 131)
 ```
 
 ## Build / test / publish
@@ -315,8 +355,16 @@ make publish   # development version → Anypoint Exchange
 make release   # release version → Anypoint Exchange
 ```
 
-`make upload-docs` uploads `definition/home.md` as the Exchange home page
-of the released version.
+### Release flow
+
+1. Bump `version` in `Cargo.toml` and add a `CHANGELOG.md` entry.
+   Exchange versions are immutable: a published version can't be
+   republished.
+2. Run `make test` and `make build`.
+3. Run `make release` to publish the definition and implementation assets.
+4. Run `make upload-docs` to upload `definition/home.md` as the
+   Exchange home page. Exchange shares the page across a minor version
+   (all 0.3.x releases show the same page).
 
 `make build` regenerates `src/generated/config.rs` from
 `definition/gcl.yaml`. Don't edit the generated file by hand — change
